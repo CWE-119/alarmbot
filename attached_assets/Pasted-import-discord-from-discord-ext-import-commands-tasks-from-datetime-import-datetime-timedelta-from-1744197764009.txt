@@ -1,0 +1,363 @@
+import discord
+from discord.ext import commands, tasks
+from datetime import datetime, timedelta
+from dateutil import parser
+import pytz
+import os
+import json
+from dotenv import load_dotenv
+import heapq
+from flask import Flask
+from threading import Thread
+import time
+import requests
+import logging
+
+# Load environment variables
+load_dotenv()
+
+# Initialize bot with required intents
+intents = discord.Intents.default()
+intents.messages = True
+intents.message_content = True
+intents.members = True
+intents.voice_states = True
+intents.guilds = True
+intents.invites = True
+
+bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
+
+# Data storage
+DATA_FILE = 'alarm_data.json'
+alarms = {}            # {user_id: {alarm_id: alarm_data}}
+user_timezones = {}    # {user_id: timezone_str}
+log_settings = {}      # {guild_id: {channel_id: int, enabled: bool}}
+free_alarm_ids = []    # Heap of available IDs
+next_alarm_id = 1      # Next available ID
+
+# Load saved data
+def load_data():
+    global alarms, user_timezones, log_settings, free_alarm_ids, next_alarm_id
+    try:
+        with open(DATA_FILE, 'r') as f:
+            data = json.load(f)
+            # Convert user IDs to int and parse datetime strings
+            alarms = {}
+            for user_id, user_alarms in data.get('alarms', {}).items():
+                alarms[int(user_id)] = {}
+                for alarm_id, alarm_data in user_alarms.items():
+                    alarm_data = alarm_data.copy()
+                    alarm_data['time'] = datetime.fromisoformat(alarm_data['time'].replace('Z', '+00:00'))
+                    alarms[int(user_id)][int(alarm_id)] = alarm_data
+
+            user_timezones = data.get('user_timezones', {})
+            log_settings = data.get('log_settings', {})
+            free_alarm_ids = data.get('free_alarm_ids', [])
+            next_alarm_id = data.get('next_alarm_id', 1)
+            # Convert heap back to integers
+            free_alarm_ids = [-x for x in free_alarm_ids]
+            heapq.heapify(free_alarm_ids)
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+
+def save_data():
+    data = {
+        'alarms': alarms,
+        'user_timezones': user_timezones,
+        'log_settings': log_settings,
+        'free_alarm_ids': [-x for x in free_alarm_ids],
+        'next_alarm_id': next_alarm_id
+    }
+    with open(DATA_FILE, 'w') as f:
+        json.dump(data, f, default=str)
+
+# ID management using heapq
+def get_alarm_id():
+    global next_alarm_id
+    if free_alarm_ids:
+        return -heapq.heappop(free_alarm_ids)
+    alarm_id = next_alarm_id
+    next_alarm_id += 1
+    return alarm_id
+
+def free_alarm_id(alarm_id):
+    heapq.heappush(free_alarm_ids, -alarm_id)
+
+# Custom Help Command
+@bot.command(name='alarmhelp')
+async def custom_help(ctx):
+    help_embed = discord.Embed(
+        title="Alarm Bot Commands Help",
+        color=discord.Color.blue()
+    )
+
+    commands = {
+        '!help': 'Show this help message',
+        '!settimezone <timezone>': 'Set your timezone (e.g., America/New_York)',
+        '!gettimezone': 'Show your current timezone',
+        '!setalarm <time> [message]': 'Set an alarm (supports natural time)',
+        '!listalarms': 'List all your active alarms',
+        '!editalarm <id> [new_time] [new_message]': 'Modify an existing alarm',
+        '!deletealarm <id>': 'Delete an alarm',
+        '!setlogchannel <channel>': 'Set logging channel (Admin only)',
+        '!toggledeletelog': 'Toggle message delete logging (Admin only)'
+    }
+
+    for cmd, desc in commands.items():
+        help_embed.add_field(name=cmd, value=desc, inline=False)
+
+    await ctx.send(embed=help_embed)
+
+# Timezone Commands
+@bot.command(name='settimezone')
+async def set_timezone(ctx, timezone: str):
+    try:
+        pytz.timezone(timezone)  # Validate timezone
+        user_timezones[ctx.author.id] = timezone
+        save_data()
+        await ctx.send(f'(⊙_⊙)？ Timezone set to {timezone}')
+    except pytz.UnknownTimeZoneError:
+        await ctx.send('~_~ Invalid timezone. Use format like "Continent/City"')
+
+@bot.command(name='gettimezone')
+async def get_timezone(ctx):
+    timezone = user_timezones.get(ctx.author.id, 'UTC')
+    await ctx.send(f'(￣┰￣*) Your timezone: {timezone}')
+
+# Alarm Commands
+@bot.command(name='setalarm')
+async def set_alarm(ctx, time_str: str, *, message: str = "Alarm!"):
+    try:
+        user_id = ctx.author.id
+        timezone = user_timezones.get(user_id, 'UTC')
+        tz = pytz.timezone(timezone)
+
+        # Enhanced time parsing
+        now = datetime.now(tz)
+        parsed_time = parser.parse(time_str, fuzzy=True, default=now)
+
+        if parsed_time.tzinfo is None:
+            parsed_time = tz.localize(parsed_time)
+
+        # Handle relative times
+        if parsed_time <= now:
+            if "tomorrow" in time_str.lower():
+                parsed_time += timedelta(days=1)
+            else:
+                parsed_time += timedelta(days=1 if parsed_time.time() < now.time() else 0)
+
+        alarm_id = get_alarm_id()
+        alarms.setdefault(user_id, {})[alarm_id] = {
+            'time': parsed_time.astimezone(pytz.utc),
+            'message': message,
+            'channel_id': ctx.channel.id,
+            'timezone': timezone
+        }
+        save_data()
+
+        await ctx.send(
+            f"(＞﹏＜ Alarm set for {parsed_time.strftime('%Y-%m-%d %H:%M')} ({timezone})\n"
+            f"Message: {message}\n"
+            f"ID: {alarm_id}"
+        )
+    except (ValueError, OverflowError):
+        await ctx.send("~_~ Invalid time format. Try: '3pm', '15:30', or 'tomorrow 9am'")
+
+@bot.command(name='listalarms')
+async def list_alarms(ctx):
+    user_id = ctx.author.id
+    if not alarms.get(user_id):
+        await ctx.send("(￣o￣).zZ  No active alarms")
+        return
+
+    timezone = pytz.timezone(user_timezones.get(user_id, 'UTC'))
+    alarm_list = []
+
+    for aid, alarm in sorted(alarms[user_id].items(), key=lambda x: x[1]['time']):
+        local_time = alarm['time'].astimezone(timezone)
+        alarm_list.append(
+            f"** ID {aid}** - {local_time.strftime('%a %b %d %H:%M')}\n"
+            f" Message: {alarm['message']}"
+        )
+
+    embed = discord.Embed(
+        title="Your Active Alarms",
+        description="\n\n".join(alarm_list) or "No alarms set",
+        color=discord.Color.gold()
+    )
+    await ctx.send(embed=embed)
+
+@bot.command(name='editalarm')
+async def edit_alarm(ctx, alarm_id: int, time_str: str = None, *, new_message: str = None):
+    user_id = ctx.author.id
+
+    if user_id not in alarms or alarm_id not in alarms[user_id]:
+        await ctx.send("~_~ Alarm not found")
+        return
+
+    alarm = alarms[user_id][alarm_id]
+    timezone = alarm["timezone"]
+    tz = pytz.timezone(timezone)
+
+    if time_str:
+        try:
+            now = datetime.now(tz)
+            parsed_time = parser.parse(time_str, fuzzy=True, default=now)
+
+            if parsed_time.tzinfo is None:
+                parsed_time = tz.localize(parsed_time)
+
+            if parsed_time <= now:
+                parsed_time += timedelta(days=1)
+
+            alarm['time'] = parsed_time.astimezone(pytz.utc)
+        except (ValueError, OverflowError):
+            await ctx.send("Invalid time format. Time not updated")
+
+    if new_message:
+        alarm['message'] = new_message
+
+    save_data()
+    local_time = alarm['time'].astimezone(tz)
+    await ctx.send(
+        f"⏰ Alarm {alarm_id} updated:\n"
+        f"🕒 New time: {local_time.strftime('%Y-%m-%d %H:%M')} ({timezone})\n"
+        f"📝 New message: {alarm['message']}"
+    )
+
+@bot.command(name='deletealarm')
+async def delete_alarm(ctx, alarm_id: int):
+    user_id = ctx.author.id
+    if user_id in alarms and alarm_id in alarms[user_id]:
+        del alarms[user_id][alarm_id]
+        free_alarm_id(alarm_id)
+        save_data()
+        await ctx.send(f" \^o^/ Alarm {alarm_id} deleted")
+    else:
+        await ctx.send("~_~ Alarm not found")
+
+# Logging System
+@bot.command(name='setlogchannel')
+@commands.has_permissions(administrator=True)
+async def set_log_channel(ctx, channel: discord.TextChannel):
+    log_settings[str(ctx.guild.id)] = {
+        'channel_id': channel.id,
+        'log_deletes': True
+    }
+    save_data()
+    await ctx.send(f"📜 Logging channel set to {channel.mention}")
+
+@bot.command(name='toggledeletelog')
+@commands.has_permissions(administrator=True)
+async def toggle_delete_log(ctx):
+    guild_id = str(ctx.guild.id)
+    if guild_id in log_settings:
+        log_settings[guild_id]['log_deletes'] = not log_settings[guild_id].get('log_deletes', True)
+        save_data()
+        status = 'enabled ▲' if log_settings[guild_id]['log_deletes'] else 'disabled △'
+        await ctx.send(f"◼ Message delete logging {status}")
+    else:
+        await ctx.send("~_~ Set a log channel first with !setlogchannel")
+
+# Event Handlers
+@bot.event
+async def on_message_delete(message):
+    if message.author.bot or not message.guild:
+        return
+
+    guild_id = str(message.guild.id)
+    if log_settings.get(guild_id, {}).get('log_deletes', False):
+        channel = bot.get_channel(log_settings[guild_id]['channel_id'])
+        if channel:
+            content = message.content.replace('`', "'")[:900]  # Prevent code block breaking
+            await channel.send(
+                f"🗑️ Message deleted in {message.channel.mention} by {message.author.mention}:\n"
+                f"```{content}```"
+            )
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    if not member.guild:
+        return
+
+    guild_id = str(member.guild.id)
+    if guild_id in log_settings:
+        channel = bot.get_channel(log_settings[guild_id]['channel_id'])
+        if before.channel != after.channel:
+            action = ""
+            if not before.channel:
+                action = f"joined 🔊 {after.channel.name}"
+            elif not after.channel:
+                action = f"left 🔇 {before.channel.name}"
+            if channel and action:
+                await channel.send(f"🎤 {member.mention} {action}")
+
+# Alarm Checker
+@tasks.loop(seconds=15)
+async def check_alarms():
+    now = datetime.now(pytz.utc)
+    to_remove = []
+
+    for user_id, user_alarms in alarms.items():
+        for alarm_id, alarm in list(user_alarms.items()):
+            if now >= alarm['time']:
+                try:
+                    channel = bot.get_channel(alarm['channel_id'])
+                    if channel:
+                        user = await bot.fetch_user(user_id)
+                        await channel.send(f"🔔 {user.mention} **ALARM**: {alarm['message']}")
+                except Exception as e:
+                    print(f"Error triggering alarm: {e}")
+                finally:
+                    del user_alarms[alarm_id]
+                    free_alarm_id(alarm_id)
+                    to_remove.append((user_id, alarm_id))
+
+    for user_id, alarm_id in to_remove:
+        if user_id in alarms and not alarms[user_id]:
+            del alarms[user_id]
+    if to_remove:
+        save_data()
+        
+# disable flask logging
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.ERROR)
+
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot Status: 🟢 Online"
+
+def ping_self():
+    while True:
+        try:
+            requests.get("https://www.google.com")
+            time.sleep(300)  # 5 minutes
+        except requests.exceptions.RequestException as e:
+            print(f"Ping error: {e}")
+            time.sleep(300)
+
+def run():
+    app.run(host='0.0.0.0', port=5000,debug=False,use_reloader=False)
+
+def keep_alive():
+    Thread(target=run).start()
+    Thread(target=ping_self).start()
+
+# Startup
+@bot.event
+async def on_ready():
+    print(f'Logged in as {bot.user} (ID: {bot.user.id})')
+    load_data()
+    check_alarms.start()
+
+# Keep alive
+keep_alive()
+
+try:
+    bot.run(os.getenv('DISCORD_TOKEN'))
+except discord.LoginFailure:
+    print("~_~ Invalid token - check your DISCORD_TOKEN")
+except Exception as e:
+    print(f"~_~ Error starting bot: {e}")
