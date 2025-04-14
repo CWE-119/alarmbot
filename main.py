@@ -250,6 +250,7 @@ async def check_alarms():
 @bot.event
 async def on_ready():
     print(f'Logged in as {bot.user} (ID: {bot.user.id})')
+    await bot.change_presence(status=discord.Status.online)
     await init_db()
     check_alarms.start()
 
