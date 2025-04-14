@@ -2,12 +2,10 @@
 name = "python-template"
 version = "0.1.0"
 description = ""
-authors = ["Your Name <you@example.com>"]
 requires-python = ">=3.11"
 dependencies = [
     "aiosqlite>=0.21.0",
     "discord-py>=2.5.2",
-    "flask>=3.1.0",
     "python-dateutil>=2.9.0.post0",
     "python-dotenv>=1.1.0",
     "pytz>=2025.2",

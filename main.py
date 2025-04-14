@@ -151,7 +151,7 @@ async def delete_alarm_command(ctx, alarm_id: int):
     user_alarms = await get_user_alarms(ctx.author.id)
     if any(alarm['id'] == alarm_id for alarm in user_alarms):
         await delete_alarm(alarm_id)
-        await ctx.send(f" \^o^/ Alarm {alarm_id} deleted")
+        await ctx.send(f"\\Alarm {alarm_id} deleted")
     else:
         await ctx.send("~_~ Alarm not found")
 
@@ -245,31 +245,6 @@ async def check_alarms():
             print(f"Error triggering alarm: {e}")
             await delete_alarm(alarm['id'])
 
-# disable flask logging
-log = logging.getLogger('werkzeug')
-log.setLevel(logging.ERROR)
-
-app = Flask('')
-
-@app.route('/')
-def home():
-    return "Bot Status: 🟢 Online"
-
-def ping_self():
-    while True:
-        try:
-            requests.get("https://af3200f5-59a1-4b2e-930d-1726c7553281-00-3dhhv0u1r2p71.spock.replit.dev/")
-            time.sleep(300)  # 5 minutes
-        except requests.exceptions.RequestException as e:
-            print(f"Ping error: {e}")
-            time.sleep(300)
-
-def run():
-    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
-
-def keep_alive():
-    Thread(target=run).start()
-    Thread(target=ping_self).start()
 
 # Startup
 @bot.event
@@ -278,12 +253,4 @@ async def on_ready():
     await init_db()
     check_alarms.start()
 
-# Keep alive
-keep_alive()
-
-try:
-    bot.run(os.getenv('DISCORD_TOKEN'))
-except discord.LoginFailure:
-    print("~_~ Invalid token - check your DISCORD_TOKEN")
-except Exception as e:
-    print(f"~_~ Error starting bot: {e}")
+bot.run(os.getenv('DISCORD_TOKEN'))
