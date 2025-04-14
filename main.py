@@ -253,4 +253,9 @@ async def on_ready():
     await init_db()
     check_alarms.start()
 
-bot.run(os.getenv('DISCORD_TOKEN'))
+try:
+    bot.run(os.getenv('DISCORD_TOKEN'))
+except discord.LoginFailure:
+    print("~_~ Invalid token - check your DISCORD_TOKEN")
+except Exception as e:
+    print(f"~_~ Error starting bot: {e}")
