@@ -23,6 +23,7 @@ intents.members = True
 intents.voice_states = True
 intents.guilds = True
 intents.invites = True
+guild_invites = {}
 
 bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
 
@@ -245,6 +246,86 @@ async def check_alarms():
             print(f"Error triggering alarm: {e}")
             await delete_alarm(alarm['id'])
 
+# New event handlers
+@bot.event
+async def on_guild_join(guild):
+    try:
+        invites = await guild.invites()
+        guild_invites[guild.id] = {invite.code: invite for invite in invites}
+    except Exception as e:
+        print(f"Error fetching invites for new guild {guild}: {e}")
+
+@bot.event 
+async def on_invite_create(invite):
+    guild_id = invite.guild.id
+    if guild_id not in guild_invites:
+        guild_invites[guild_id] = {}
+    guild_invites[guild_id][invite.code] = invite
+
+@bot.event
+async def on_invite_delete(invite):
+    guild_id = invite.guild.id
+    if guild_id in guild_invites and invite.code in guild_invites[guild_id]:
+        del guild_invites[guild_id][invite.code]
+
+# Member tracking
+@bot.event
+async def on_member_join(member):
+    guild = member.guild
+    settings = await get_log_settings(guild.id)
+    if not settings or not settings[0]:
+        return
+
+    log_channel = bot.get_channel(settings[0])
+    if not log_channel:
+        return
+
+    try:
+        # Get before/after invites
+        cached = guild_invites.get(guild.id, {})
+        actual = {invite.code: invite for invite in await guild.invites()}
+        guild_invites[guild.id] = actual  # Update cache
+
+        # Find used invite
+        used_invite = None
+        for code, new_invite in actual.items():
+            old_invite = cached.get(code)
+            if not old_invite or new_invite.uses > old_invite.uses:
+                used_invite = new_invite
+                break
+
+        # Fallback check deleted invites
+        if not used_invite:
+            for code, old_invite in cached.items():
+                if code not in actual and old_invite.uses < old_invite.max_uses:
+                    used_invite = old_invite
+                    break
+
+        if used_invite:
+            inviter = used_invite.inviter
+            msg = (f"**{member.mention}** joined using invite "
+                   f"`{used_invite.code}` created by {inviter.mention} "
+                   f"(Total uses: {used_invite.uses})")
+        else:
+            msg = f"**{member.mention}** joined (unknown invite)"
+
+        await log_channel.send(msg)
+    except Exception as e:
+        print(f"Join logging error: {e}")
+        await log_channel.send(f"**{member.mention}** joined (error tracking invite)")
+
+@bot.event
+async def on_member_remove(member):
+    guild = member.guild
+    settings = await get_log_settings(guild.id)
+    if not settings or not settings[0]:
+        return
+
+    log_channel = bot.get_channel(settings[0])
+    if log_channel:
+        await log_channel.send(f"**{member.mention}** left the server")
+
+
 
 # Startup
 @bot.event
@@ -253,6 +334,12 @@ async def on_ready():
     await bot.change_presence(status=discord.Status.online)
     await init_db()
     check_alarms.start()
+    for guild in bot.guilds:
+        try:
+            invites = await guild.invites()
+            guild_invites[guild.id] = {invite.code: invite for invite in invites}
+        except Exception as e:
+            print(f"Error initializing invites for {guild}: {e}")
 
 try:
     bot.run(os.getenv('DISCORD_TOKEN'))
