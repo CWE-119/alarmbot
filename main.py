@@ -326,6 +326,55 @@ async def on_member_remove(member):
         await log_channel.send(f"**{member.mention}** left the server")
 
 
+@bot.event
+async def on_voice_state_update(member, before, after):
+    if not member.guild:
+        return
+
+    settings = await get_log_settings(member.guild.id)
+    if not settings or not settings[0]:  # Check if log channel is set
+        return
+
+    log_channel = bot.get_channel(settings[0])
+    if not log_channel:
+        return
+
+    if before.channel != after.channel:
+        try:
+            if before.channel and after.channel:
+                # User moved between channels
+                moved_by_mod = False
+                # Check audit logs for move action
+                async for entry in member.guild.audit_logs(action=discord.AuditLogAction.member_update, limit=5):
+                    if entry.target and entry.target.id == member.id:
+                        # Check if the change was in voice channel
+                        for change in entry.changes:
+                            if change.key == 'voice_channel':
+                                old_ch_id = change.old_value.id if change.old_value else None
+                                new_ch_id = change.new_value.id if change.new_value else None
+                                if old_ch_id == before.channel.id and new_ch_id == after.channel.id:
+                                    # Found the entry
+                                    moved_by_mod = True
+                                    reason = entry.reason or "No reason provided"
+                                    await log_channel.send(
+                                        f"🎤 {member.mention} was moved by {entry.user.mention} "
+                                        f"from {before.channel.mention} to {after.channel.mention}\n"
+                                        f"**Reason:** {reason}"
+                                    )
+                                    break
+                        if moved_by_mod:
+                            break
+                if not moved_by_mod:
+                    await log_channel.send(f"🎤 {member.mention} moved from {before.channel.mention} to {after.channel.mention}")
+            elif not before.channel:
+                # Joined voice channel
+                await log_channel.send(f"🎤 {member.mention} joined {after.channel.mention} 🔊")
+            else:
+                # Left voice channel
+                await log_channel.send(f"🎤 {member.mention} left {before.channel.mention} 🔇")
+        except Exception as e:
+            print(f"Error handling voice state update: {e}")
+
 
 # Startup
 @bot.event
