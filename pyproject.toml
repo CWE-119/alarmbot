@@ -1,13 +1,27 @@
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
 [project]
-name = "python-template"
-version = "0.1.0"
-description = ""
+name = "discord-alarm-guardian"
+version = "0.2.0"
+description = "Discord reminders, server-scoped moderation, and opt-in security alerts"
 requires-python = ">=3.11"
 dependencies = [
-    "aiosqlite>=0.21.0",
-    "discord-py>=2.5.2",
-    "python-dateutil>=2.9.0.post0",
-    "python-dotenv>=1.1.0",
-    "pytz>=2025.2",
-    "requests>=2.32.3",
+    "discord.py==2.7.1",
+    "aiosqlite==0.22.1",
+    "python-dateutil==2.9.0.post0",
+    "python-dotenv==1.2.4",
+    "pytz==2026.5",
 ]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10", "pytest-asyncio>=0.24,<2"]
+
+[tool.setuptools]
+py-modules = ["main", "database", "guardian", "guardian_store", "scheduling", "alarm_store", "community", "community_store", "privacy", "maintenance"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]

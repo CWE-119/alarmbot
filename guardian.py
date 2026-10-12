@@ -13,12 +13,15 @@ import asyncio
 import collections
 import hashlib
 import io
+import json
 import os
 import re
 import time
+import weakref
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from typing import Optional
+from urllib.parse import urlsplit, urlunsplit
 
 import discord
 import pytz
@@ -26,11 +29,13 @@ from dateutil.relativedelta import relativedelta
 from discord.ext import commands, tasks
 
 import database as db
+import guardian_store as store
 
 UTC = pytz.UTC
 MAX_READ_BYTES = 25 * 1024 * 1024
+MEDIA_WORKERS = 2
+MEDIA_QUEUE_SIZE = 32
 MAX_TIMEOUT = timedelta(days=27, hours=23)          # Discord caps a timeout at 28 days
-RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "0") or 0)
 
 CATEGORIES = {
     "messages":   "deleted / edited / bulk-deleted messages (+ who deleted)",
@@ -90,6 +95,32 @@ def domains_of(s) -> set:
         if d and not any(d == x or d.endswith("." + x) for x in SAFE_DOMAINS):
             out.add(d)
     return out
+
+
+def urls_of(content: str) -> set:
+    """Compare complete evidence URLs; a shared hostname is never enough."""
+    urls = set()
+    for value in re.findall(r"https?://[^\s<>]+", content or "", re.I):
+        value = value.rstrip(".,!?)]}")
+        try:
+            parts = urlsplit(value)
+            if parts.hostname:
+                urls.add(urlunsplit((parts.scheme.lower(), parts.netloc.lower(),
+                                    parts.path or "/", parts.query, "")))
+        except ValueError:
+            continue
+    return urls
+
+
+def can_moderate(actor, target, guild) -> bool:
+    """The bot's role never substitutes for the invoking moderator's authority."""
+    if target is None or target.id == actor.id or target.id == guild.owner_id:
+        return False
+    return actor.id == guild.owner_id or actor.top_role > target.top_role
+
+
+def same_timeout(current, recorded: str) -> bool:
+    return current is not None and abs((current - datetime.fromisoformat(recorded)).total_seconds()) < 1
 
 
 def safe_name(n: str) -> str:
@@ -209,8 +240,12 @@ class Guardian(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.flagged: dict = {}
-        self.exempt: dict = {}
+        self.exempt: set = set()
         self.protect_off: set = set()
+        self.network_enabled: set = set()
+        self.trusted_sources: set = set()
+        self.report_only: set = set()
+        self.pattern_exempt: set = set()
         self.mirror_off: set = set()
         self.routes: dict = {}
         self.fp_cache: list = []
@@ -221,31 +256,42 @@ class Guardian(commands.Cog):
         self.sem = asyncio.Semaphore(4)
         self._tasks: set = set()
         self._seeded = False
+        self.media_queue = asyncio.Queue(maxsize=MEDIA_QUEUE_SIZE)
+        self.media_workers = []
+        self.media_dropped = 0
+        self._notice_times = {}
+        self._timeout_locks = weakref.WeakValueDictionary()
 
     # ------------------------------------------------------------ lifecycle
     async def cog_load(self):
+        await store.init()
         await self.refresh_cache()
         self.enforce_loop.start()
-        self.retention_loop.start()
+        self.media_workers = [asyncio.create_task(self.media_worker()) for _ in range(MEDIA_WORKERS)]
 
     async def cog_unload(self):
         self.enforce_loop.cancel()
-        self.retention_loop.cancel()
+        for task in self.media_workers + list(self._tasks):
+            task.cancel()
+        await asyncio.gather(*self.media_workers, *list(self._tasks), return_exceptions=True)
 
     async def refresh_cache(self):
-        self.flagged = {f["user_id"]: f for f in await db.get_active_flags()}
-        self.exempt = {}
-        for e in await db.get_exempts():
-            self.exempt.setdefault(e["user_id"], set()).add(e["guild_id"])
-        self.protect_off = await db.get_protection_off()
+        snapshot = await store.snapshot()
+        self.flagged = {(f["source_guild_id"], f["user_id"]): f for f in snapshot["flags"]}
+        self.exempt = {(e["guild_id"], e["source_guild_id"], e["user_id"]) for e in snapshot["exempts"]}
+        self.network_enabled = {s["guild_id"] for s in snapshot["settings"] if s["network_enabled"]}
+        self.report_only = {s["guild_id"] for s in snapshot["settings"] if s["report_only"]}
+        self.trusted_sources = {(s["guild_id"], s["source_guild_id"]) for s in snapshot["trust"]}
+        self.pattern_exempt = {(s["guild_id"], s["pattern_id"]) for s in snapshot["pattern_exempts"]}
         self.mirror_off = await db.get_mirror_off()
         self.routes = await db.get_routes()
         self.fp_cache = []
-        for f in await db.get_fingerprints():
+        for f in snapshot["patterns"]:
             self.fp_cache.append({
+                "id": f["id"], "source_guild_id": f["source_guild_id"],
                 "user_id": f["user_id"], "hash": f["content_hash"], "norm": f["sample"] or "",
-                "domains": set(filter(None, (f["domains"] or "").split(","))),
-                "shas": set(filter(None, (f["attachment_shas"] or "").split(","))),
+                "urls": set(json.loads(f["urls"])),
+                "shas": set(json.loads(f["attachment_shas"])),
             })
 
     @commands.Cog.listener()
@@ -264,7 +310,8 @@ class Guardian(commands.Cog):
                 members.append({"guild_id": g.id, "user_id": m.id, "nickname": m.nick,
                                 "joined": m.joined_at.isoformat() if m.joined_at else None})
         try:
-            changed = await db.sync_profiles(profiles, members)
+            changed = await db.sync_profiles(profiles, members,
+                                            complete_guild_ids=[g.id for g in self.bot.guilds if g.chunked])
             print(f"[guardian] synced {len(profiles)} profiles, {changed} offline changes recorded")
         except Exception as e:
             print(f"[guardian] startup sync failed: {e}")
@@ -281,15 +328,22 @@ class Guardian(commands.Cog):
         if rid == 0:
             return None
         if rid:
-            return self.bot.get_channel(rid)
-        s = await db.get_log_settings(guild_id)
-        return self.bot.get_channel(s[0]) if s and s[0] else None
+            channel = self.bot.get_channel(rid)
+        else:
+            settings = await db.get_log_settings(guild_id)
+            channel = self.bot.get_channel(settings[0]) if settings and settings[0] else None
+        return channel if channel and getattr(getattr(channel, "guild", None), "id", None) == guild_id else None
 
     async def send_log(self, guild_id: int, category: str, **kw):
+        subject_id = kw.pop("_subject_id", None)
         ch = await self.log_channel(guild_id, category)
         if ch:
             try:
-                return await ch.send(**kw)
+                kw.setdefault("allowed_mentions", discord.AllowedMentions.none())
+                sent = await ch.send(**kw)
+                if subject_id is not None:
+                    await store.add_media(guild_id, subject_id, None, ch.id, sent.id, "member_log")
+                return sent
             except discord.HTTPException:
                 pass
         return None
@@ -302,11 +356,11 @@ class Guardian(commands.Cog):
     async def is_owner(self, user) -> bool:
         return await self.bot.is_owner(user)
 
-    def consume(self, action: str, *, target=None, channel=None, max_age=15):
+    def consume(self, action: str, *, guild_id: int, target=None, channel=None, max_age=15):
         """Find (and use up one count of) a recent audit entry. Used to attribute moves/disconnects."""
         now = time.monotonic()
         for e in reversed(self.audit_buf):
-            if e["action"] != action or now - e["ts"] > max_age or e["left"] <= 0:
+            if e["guild_id"] != guild_id or e["action"] != action or now - e["ts"] > max_age or e["left"] <= 0:
                 continue
             if target is not None and e["target"] != target:
                 continue
@@ -316,10 +370,10 @@ class Guardian(commands.Cog):
             return e
         return None
 
-    def find_recent(self, action: str, *, target=None, channel=None, key=None, max_age=15):
+    def find_recent(self, action: str, *, guild_id: int, target=None, channel=None, key=None, max_age=15):
         now = time.monotonic()
         for e in reversed(self.audit_buf):
-            if e["action"] != action or now - e["ts"] > max_age:
+            if e["guild_id"] != guild_id or e["action"] != action or now - e["ts"] > max_age:
                 continue
             if target is not None and e["target"] != target:
                 continue
@@ -335,9 +389,13 @@ class Guardian(commands.Cog):
         asset = user.avatar
         if asset is None:
             return None
-        existing = await db.get_avatar_mirror(user.id, asset.key)
-        if existing:
-            return existing
+        if not await db.should_archive(guild_id, 0, user.id):
+            return None
+        existing = await store.list_media(guild_id=guild_id, author_id=user.id, kind="avatar", asset_key=asset.key)
+        for row in existing:
+            mirrored = await self.fetch_mirror(row)
+            if mirrored and mirrored.attachments:
+                return mirrored.attachments[0].url
         ch = await self.log_channel(guild_id, "media")
         live = asset.replace(size=1024).url
         if not ch or guild_id in self.mirror_off:
@@ -350,10 +408,58 @@ class Guardian(commands.Cog):
             emb.set_image(url=f"attachment://avatar.{ext}")
             sent = await ch.send(embed=emb, file=discord.File(io.BytesIO(data), filename=f"avatar.{ext}"))
             url = sent.attachments[0].url
-            await db.add_avatar_mirror(user.id, asset.key, url)
+            await store.add_media(guild_id, user.id, None, ch.id, sent.id, "avatar", asset.key)
             return url
         except discord.HTTPException:
             return live
+
+    async def fetch_mirror(self, row):
+        channel = self.bot.get_channel(row["channel_id"])
+        if not channel or getattr(getattr(channel, "guild", None), "id", None) != row["guild_id"]:
+            return None
+        try:
+            return await channel.fetch_message(row["message_id"])
+        except discord.NotFound:
+            await store.remove_media(row["id"])
+        except discord.HTTPException:
+            pass
+        return None
+
+    async def refreshed_attachments(self, message_id, guild_id):
+        attachments = await db.get_attachments(message_id)
+        fresh = {}
+        for row in await store.list_media(guild_id=guild_id, original_message_id=message_id, kind="attachment"):
+            mirrored = await self.fetch_mirror(row)
+            if mirrored:
+                fresh.update({a.filename: a.url for a in mirrored.attachments})
+        for attachment in attachments:
+            # A stored signed CDN URL alone is not a durable reference.
+            attachment["mirror_url"] = fresh.get(safe_name(attachment["filename"]))
+        return attachments
+
+    async def _erase_media(self, rows):
+        removed, failed = 0, 0
+        for row in rows:
+            channel = self.bot.get_channel(row["channel_id"])
+            if not channel or getattr(getattr(channel, "guild", None), "id", None) != row["guild_id"]:
+                failed += 1
+                continue
+            try:
+                await channel.get_partial_message(row["message_id"]).delete()
+            except discord.NotFound:
+                pass
+            except discord.HTTPException:
+                failed += 1
+                continue
+            await store.remove_media(row["id"])
+            removed += 1
+        return {"removed": removed, "failed": failed}
+
+    async def erase_user_media(self, user_id, guild_id=None):
+        return await self._erase_media(await store.list_media(guild_id=guild_id, author_id=user_id))
+
+    async def prune_media(self, cutoff, guild_id=None):
+        return await self._erase_media(await store.list_media(guild_id=guild_id, before=cutoff))
 
     # ------------------------------------------------------------ setup / admin commands
     @commands.command(name="setuplogs", aliases=["setlogchannel"])
@@ -361,6 +467,8 @@ class Guardian(commands.Cog):
     @commands.has_permissions(administrator=True)
     async def setuplogs(self, ctx, channel: discord.TextChannel):
         """One command: default log channel + every log type on. Saved in the DB, survives restarts."""
+        if channel.guild.id != ctx.guild.id:
+            return await ctx.send("Choose a log channel in this server.")
         await db.enable_all_logging(ctx.guild.id, channel.id)
         await self.refresh_cache()
         warn = []
@@ -395,6 +503,8 @@ class Guardian(commands.Cog):
             msg = f"`{category}` now follows the default log channel."
         else:
             ch = await commands.TextChannelConverter().convert(ctx, target)
+            if ch.guild.id != ctx.guild.id:
+                return await ctx.send("Choose a log channel in this server.")
             await db.set_route(ctx.guild.id, category, ch.id)
             msg = f"`{category}` → {ch.mention}"
         await self.refresh_cache()
@@ -453,8 +563,10 @@ class Guardian(commands.Cog):
         emb.add_field(name="Default channel", value=default, inline=False)
         emb.add_field(name="Routing", value="\n".join(lines), inline=False)
         emb.add_field(name="Options", value=(f"media mirror: {'off' if ctx.guild.id in self.mirror_off else 'on'}\n"
-                                              f"network protection: {'off' if ctx.guild.id in self.protect_off else 'on'}\n"
-                                              f"retention: {RETENTION_DAYS or 'forever'} days"), inline=False)
+                                              f"network protection: {'on' if ctx.guild.id in self.network_enabled else 'off'}\n"
+                                              f"mode: {'report only' if ctx.guild.id in self.report_only else 'enforce'}\n"
+                                              f"media queue: {self.media_queue.qsize()}/{MEDIA_QUEUE_SIZE}; skipped: {self.media_dropped}\n"
+                                              "retention: see `!privacysettings`"), inline=False)
         emb.add_field(name="Bot permissions", value="\n".join(checks), inline=False)
         await ctx.send(embed=emb)
 
@@ -465,61 +577,161 @@ class Guardian(commands.Cog):
         """!protect on|off - whether this server accepts compromised-account flags from other servers."""
         if state.lower() not in ("on", "off"):
             return await ctx.send("Usage: `!protect on` or `!protect off`")
-        await db.set_protection(ctx.guild.id, state.lower() == "on")
+        await store.set_option(ctx.guild.id, "network_enabled", state.lower() == "on")
         await self.refresh_cache()
-        await ctx.send(f"🛡️ Network protection is now **{state.lower()}** for this server.")
+        await ctx.send(f"🛡️ Network protection is now **{state.lower()}** for this server. "
+                       "Only sources explicitly added with `!trustserver <server-id> on` are accepted.")
+
+    @commands.hybrid_command(name="trustserver")
+    @commands.guild_only()
+    @commands.has_permissions(administrator=True)
+    async def trustserver(self, ctx, server_id: str, state: str):
+        """Trust or remove a security source. Ordinary server data is never shared."""
+        if not server_id.isdigit() or state.lower() not in ("on", "off"):
+            return await ctx.send("Usage: `!trustserver <server-id> on|off`")
+        source_id = int(server_id)
+        if source_id == ctx.guild.id:
+            return await ctx.send("Local security does not need network trust.")
+        await store.trust(ctx.guild.id, source_id, state.lower() == "on")
+        await self.refresh_cache()
+        await ctx.send(f"Security trust for `{source_id}` is **{state.lower()}**. "
+                       "Receiving security signals also requires `!protect on`.")
+
+    @commands.hybrid_command(name="securitymode")
+    @commands.guild_only()
+    @commands.has_permissions(administrator=True)
+    async def securitymode(self, ctx, mode: str):
+        """Choose report or enforce for Guardian's automatic security actions."""
+        if mode.lower() not in ("report", "enforce"):
+            return await ctx.send("Usage: `!securitymode report|enforce`")
+        await store.set_option(ctx.guild.id, "report_only", mode.lower() == "report")
+        await self.refresh_cache()
+        await ctx.send(f"Guardian security mode: **{mode.lower()}**.")
+
+    @commands.hybrid_command(name="patterns")
+    @commands.guild_only()
+    @commands.has_permissions(moderate_members=True)
+    async def patterns(self, ctx):
+        """Review security patterns applicable to this server."""
+        visible = [p for p in self.fp_cache if self.pattern_applies(p, ctx.guild.id)]
+        lines = [f"`{p['id']}` · source `{p['source_guild_id']}` · "
+                 f"{len(p['urls'])} exact URL(s), {len(p['shas'])} file hash(es), "
+                 f"text {'yes' if p['hash'] else 'no'}" for p in visible[:25]]
+        await self.private_response(ctx, content="Security patterns:\n" + ("\n".join(lines) or "None.") +
+                                    "\n`!removepattern <id>` removes your server's pattern or ignores an imported one here.")
+
+    @commands.hybrid_command(name="removepattern")
+    @commands.guild_only()
+    @commands.has_permissions(manage_messages=True, moderate_members=True)
+    async def removepattern(self, ctx, pattern_id: int):
+        """Remove a local pattern or ignore an imported pattern in this server."""
+        pattern = next((p for p in self.fp_cache if p["id"] == pattern_id and self.pattern_applies(p, ctx.guild.id)), None)
+        if not pattern:
+            return await ctx.send("No such security pattern is active in this server.")
+        await store.remove_pattern(ctx.guild.id, pattern_id)
+        await self.refresh_cache()
+        await ctx.send(f"Pattern `{pattern_id}` removed from this server's enforcement.")
 
     @commands.command(name="forgetuser")
-    @commands.is_owner()
+    @commands.guild_only()
+    @commands.has_permissions(administrator=True)
     async def forgetuser(self, ctx, user_id: int):
-        """Bot owner only: erase everything stored about a user ID (mirrored copies in log channels stay)."""
-        await db.forget_user(user_id)
+        """Administrator: erase a user's stored history and media in this server."""
+        copies = await self.erase_user_media(user_id, guild_id=ctx.guild.id)
+        await db.forget_user(user_id, guild_id=ctx.guild.id)
         await self.refresh_cache()
-        await ctx.send(f"🧽 Erased stored data for `{user_id}`.")
+        await ctx.send(f"🧽 Erased personal archive data for `{user_id}` in this server. "
+                       f"Removed {copies['removed']} mirrored posts; {copies['failed']} could not be removed. "
+                       "Active security records are managed separately.")
 
     # ------------------------------------------------------------ messages + media
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if not message.guild or message.author.bot:
             return
-        shas, items = set(), []
+        deleted = False
         try:
-            shas, items = await self.archive(message)
-        except Exception as e:
-            print(f"[guardian] archive error: {e}")
-        try:
-            await self.enforce(message, shas)
+            # Account/text checks run before any storage or media downloads.
+            deleted = await self.enforce(message, set())
         except Exception as e:
             print(f"[guardian] enforce error: {e}")
-        if items and message.guild.id not in self.mirror_off:
-            self.spawn(self.mirror_media(message, items))
+        allowed = await self.archive_allowed(message)
+        if allowed:
+            try:
+                await self.archive(message)
+                if deleted:
+                    await db.mark_deleted([message.id])
+            except Exception as e:
+                print(f"[guardian] archive error: {e}")
+        if message.attachments and (allowed or self.needs_attachment_scan(message.guild.id)):
+            try:
+                self.media_queue.put_nowait((message, deleted))
+            except asyncio.QueueFull:
+                self.media_dropped += 1
+
+    async def archive_allowed(self, message):
+        return await self.channel_archive_allowed(message.guild.id, message.channel.id, message.author.id)
+
+    async def channel_archive_allowed(self, guild_id, channel_id, user_id=None):
+        channel = self.bot.get_channel(channel_id)
+        parents = tuple(x for x in (getattr(channel, "parent_id", None),
+                                    getattr(channel, "category_id", None)) if x)
+        return await db.should_archive(guild_id, channel_id, user_id, parent_ids=parents)
+
+    def needs_attachment_scan(self, guild_id):
+        return any(p["shas"] and self.pattern_applies(p, guild_id) for p in self.fp_cache)
 
     async def archive(self, message: discord.Message):
-        await db.touch_profile(self.profile_dict(message.author))
-        await db.log_message({
+        await db.archive_message(self.profile_dict(message.author), {
             "message_id": message.id, "guild_id": message.guild.id, "channel_id": message.channel.id,
             "author_id": message.author.id, "author_name": str(message.author),
             "content": message.content, "content_hash": text_hash(message.content),
             "reply_to_id": message.reference.message_id if message.reference else None,
             "created_at_utc": message.created_at.astimezone(UTC).isoformat(),
         })
-        shas, items = set(), []
         for att in message.attachments:
-            sha, data = None, None
-            if att.size <= MAX_READ_BYTES:
-                try:
-                    data = await att.read()           # memory only
-                    sha = hashlib.sha256(data).hexdigest()
-                    shas.add(sha)
-                except discord.HTTPException:
-                    data = None
             await db.add_attachment({
                 "message_id": message.id, "guild_id": message.guild.id, "channel_id": message.channel.id,
                 "author_id": message.author.id, "filename": att.filename, "url": att.url,
-                "mirror_url": None, "sha256": sha, "size": att.size, "content_type": att.content_type,
+                "mirror_url": None, "sha256": None, "size": att.size, "content_type": att.content_type,
             })
-            items.append((att, data))
-        return shas, items
+
+    async def media_worker(self):
+        """Only workers download bytes; queue entries hold Discord metadata."""
+        while True:
+            message, deleted = await self.media_queue.get()
+            items = []
+            data = None
+            try:
+                allowed = await self.archive_allowed(message)
+                if not allowed and not self.needs_attachment_scan(message.guild.id):
+                    continue
+                remaining, shas = MAX_READ_BYTES, set()
+                for attachment in message.attachments:
+                    data = None
+                    if attachment.size <= remaining:
+                        try:
+                            data = await attachment.read()
+                        except discord.HTTPException:
+                            pass
+                        if data is not None:
+                            remaining -= len(data)
+                            sha = hashlib.sha256(data).hexdigest()
+                            shas.add(sha)
+                            if allowed:
+                                await db._run("UPDATE attachments SET sha256=? WHERE message_id=? AND url=?",
+                                              (sha, message.id, attachment.url))
+                    items.append((attachment, data))
+                if shas and not deleted:
+                    await self.enforce(message, shas)
+                if allowed and message.guild.id not in self.mirror_off:
+                    await self.mirror_media(message, items)
+            except Exception as exc:
+                print(f"[guardian] media worker error: {exc}")
+            finally:
+                items.clear()
+                data = None
+                self.media_queue.task_done()
 
     async def mirror_media(self, message: discord.Message, items: list):
         async with self.sem:
@@ -551,6 +763,8 @@ class Guardian(commands.Cog):
                     if skipped and i == 0:
                         emb.add_field(name="Not copied (too large / unreadable)", value="\n".join(skipped)[:500], inline=False)
                     sent = await ch.send(embed=emb, files=files)
+                    await store.add_media(message.guild.id, message.author.id, message.id,
+                                          ch.id, sent.id, "attachment")
                     for (a, _), ma in zip(chunk, sent.attachments):
                         await db.set_attachment_mirror(message.id, a.url, ma.url)
             except Exception as e:
@@ -568,6 +782,9 @@ class Guardian(commands.Cog):
             return
         if not payload.guild_id or payload.channel_id in self.purging:
             return
+        if not await self.channel_archive_allowed(payload.guild_id, payload.channel_id,
+                                                  row["author_id"] if row else None):
+            return
         s = await db.get_log_settings(payload.guild_id)
         if s and not s[1]:
             return
@@ -578,18 +795,19 @@ class Guardian(commands.Cog):
         await asyncio.sleep(1.5)                      # let the audit-log entry arrive
         deleter = None
         if row:
-            e = self.find_recent("message_delete", target=row["author_id"], channel=payload.channel_id, max_age=30)
+            e = self.consume("message_delete", guild_id=payload.guild_id,
+                             target=row["author_id"], channel=payload.channel_id, max_age=10)
             deleter = e["actor"] if e else None
 
         emb = discord.Embed(title="🗑️ Message deleted", color=discord.Color.red(), timestamp=now_utc())
         emb.add_field(name="Channel", value=f"<#{payload.channel_id}>")
         if row:
             emb.add_field(name="Author", value=f"<@{row['author_id']}> (`{row['author_id']}`)")
-            emb.add_field(name="Deleted by", value=f"<@{deleter}>" if deleter else "author / a bot (no audit entry)")
+            emb.add_field(name="Possible moderator", value=f"<@{deleter}> (recent matching audit action; attribution is approximate)" if deleter else "unknown")
             emb.description = short(row["content"], 3500) or "*no text*"
             emb.set_footer(text=f"Message ID {mid} • sent {row['created_at_utc'][:19]} UTC")
             shown = False
-            for a in await db.get_attachments(mid):
+            for a in await self.refreshed_attachments(mid, payload.guild_id):
                 if a["mirror_url"]:
                     emb.add_field(name="Attachment copy", value=f"[{a['filename']}]({a['mirror_url']})", inline=False)
                     if not shown and (a["content_type"] or "").startswith("image/"):
@@ -600,7 +818,9 @@ class Guardian(commands.Cog):
         else:
             emb.description = "*Not archived (sent before logging started).*"
         try:
-            await ch.send(embed=emb)
+            sent = await ch.send(embed=emb, allowed_mentions=discord.AllowedMentions.none())
+            if row:
+                await store.add_media(payload.guild_id, row["author_id"], mid, ch.id, sent.id, "message_log")
         except discord.HTTPException:
             pass
 
@@ -610,20 +830,49 @@ class Guardian(commands.Cog):
         await db.mark_deleted(ids)
         if not payload.guild_id or payload.channel_id in self.purging:
             return
+        if not await self.channel_archive_allowed(payload.guild_id, payload.channel_id):
+            return
         s = await db.get_log_settings(payload.guild_id)
         if s and not s[3]:
             return
         ch = await self.log_channel(payload.guild_id, "messages")
         if not ch:
             return
-        rows = await db.get_messages(ids[:10])
-        text = "\n".join(f"{r['author_name']}: {short(r['content'], 80)}" for r in rows) or "Not archived."
-        await ch.send(f"🧹 Bulk delete in <#{payload.channel_id}> - {len(ids)} messages\n```{text[:1500]}```")
+        await ch.send(f"🧹 Bulk delete in <#{payload.channel_id}> - {len(ids)} messages.",
+                      allowed_mentions=discord.AllowedMentions.none())
 
     @commands.Cog.listener()
     async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent):
         data = payload.data
-        if "content" not in data or (data.get("author") or {}).get("bot"):
+        if not payload.guild_id or (data.get("author") or {}).get("bot"):
+            return
+        if "content" not in data and "attachments" not in data:
+            return
+        channel = self.bot.get_channel(payload.channel_id)
+        if not channel or getattr(getattr(channel, "guild", None), "id", None) != payload.guild_id:
+            return
+        try:
+            message = await channel.fetch_message(payload.message_id)
+        except discord.HTTPException:
+            return
+        if message.author.bot:
+            return
+        deleted = await self.enforce(message, set())
+        allowed = await self.archive_allowed(message)
+        if message.attachments and allowed:
+            known = {a["url"] for a in await db.get_attachments(message.id)}
+            for attachment in message.attachments:
+                if attachment.url not in known:
+                    await db.add_attachment({"message_id": message.id, "guild_id": message.guild.id,
+                        "channel_id": channel.id, "author_id": message.author.id, "filename": attachment.filename,
+                        "url": attachment.url, "mirror_url": None, "sha256": None, "size": attachment.size,
+                        "content_type": attachment.content_type})
+        if message.attachments and (allowed or self.needs_attachment_scan(message.guild.id)):
+            try:
+                self.media_queue.put_nowait((message, deleted))
+            except asyncio.QueueFull:
+                self.media_dropped += 1
+        if "content" not in data or not allowed:
             return
         new = data["content"]
         row = await db.get_message(payload.message_id)
@@ -648,7 +897,8 @@ class Guardian(commands.Cog):
         emb.add_field(name="Before", value=f"```{short(old, 900) if old is not None else 'unknown (not archived)'}```", inline=False)
         emb.add_field(name="After", value=f"```{short(new, 900)}```", inline=False)
         emb.set_footer(text=f"Message ID {payload.message_id}")
-        await ch.send(embed=emb)
+        sent = await ch.send(embed=emb, allowed_mentions=discord.AllowedMentions.none())
+        await store.add_media(payload.guild_id, message.author.id, message.id, ch.id, sent.id, "message_log")
 
     # ------------------------------------------------------------ joins / leaves / invites
     async def cache_invites(self, guild: discord.Guild):
@@ -692,6 +942,12 @@ class Guardian(commands.Cog):
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
         guild = member.guild
+        flag = self.flag_applies(member.id, guild.id)
+        if flag:
+            result = await self.apply_timeout(guild, member.id, self.flag_expiry(flag), flag["reason"], flag["source_guild_id"])
+            await self.send_log(guild.id, "security", content=f"Flagged account {member.mention} joined: {result}.")
+        if not await db.should_archive(guild.id, 0, member.id):
+            return
         invite = await self.detect_invite(guild)
         joined = member.joined_at or now_utc()
         await db.record_member_join(guild.id, member.id, member.nick, joined.isoformat(),
@@ -700,12 +956,6 @@ class Guardian(commands.Cog):
         await db.upsert_profile(self.profile_dict(member))
         await self.mirror_avatar(member, guild.id)
 
-        if self.flag_applies(member.id, guild.id):
-            f = self.flagged[member.id]
-            await self.apply_timeout(guild, member.id, self.flag_expiry(f), "Flagged compromised account")
-            await self.send_log(guild.id, "security",
-                                content=f"🚨 Flagged compromised account {member.mention} (`{member.id}`) just joined - timed out on arrival.")
-
         lines = ["**Member joined**",
                  f"{member.mention} {ordinal(guild.member_count)} to join",
                  f"created {human_age(member.created_at, now_utc())}",
@@ -713,12 +963,14 @@ class Guardian(commands.Cog):
         if invite:
             who = invite.inviter.mention if invite.inviter else "unknown"
             lines.append(f"Invite: `{invite.code}` by {who} (uses: {invite.uses})")
-        await self.send_log(guild.id, "members", content="\n".join(lines))
+        await self.send_log(guild.id, "members", _subject_id=member.id, content="\n".join(lines))
 
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member):
+        if not await db.should_archive(member.guild.id, 0, member.id):
+            return
         await db.mark_member_left(member.guild.id, member.id)
-        await self.send_log(member.guild.id, "members",
+        await self.send_log(member.guild.id, "members", _subject_id=member.id,
                             content=f"**Member left**\n{member.mention}\nID: {member.id}")
 
     # ------------------------------------------------------------ profile / nickname tracking
@@ -735,20 +987,13 @@ class Guardian(commands.Cog):
             changes.append(("avatar", "Avatar", old_key, new_key))
         if not changes:
             return
-        await db.upsert_profile(self.profile_dict(after))
-
-        mirror_url = None
         for g in self.bot.guilds:
-            if not g.get_member(after.id):
+            if not g.get_member(after.id) or not await db.should_archive(g.id, 0, after.id):
                 continue
-            if new_key and mirror_url is None:
-                mirror_url = await self.mirror_avatar(after, g.id)
-        for kind, _, old, new in changes:
-            await db.add_history(after.id, None, kind, old, new, mirror_url if kind == "avatar" else None)
-
-        for g in self.bot.guilds:
-            if not g.get_member(after.id):
-                continue
+            await db.upsert_profile(self.profile_dict(after))
+            mirror_url = await self.mirror_avatar(after, g.id) if new_key else None
+            for kind, _, old, new in changes:
+                await db.add_history(after.id, g.id, kind, old, new, mirror_url if kind == "avatar" else None)
             emb = discord.Embed(title="👤 Profile changed", color=discord.Color.blurple(), timestamp=now_utc(),
                                 description=f"{after.mention} (`{after.id}`)")
             for _, label, old, new in changes:
@@ -761,21 +1006,23 @@ class Guardian(commands.Cog):
                     emb.set_thumbnail(url=before.avatar.replace(size=128).url)
                 if mirror_url:
                     emb.set_image(url=mirror_url)
-            await self.send_log(g.id, "members", embed=emb)
+            await self.send_log(g.id, "members", _subject_id=after.id, embed=emb)
 
     @commands.Cog.listener()
     async def on_member_update(self, before: discord.Member, after: discord.Member):
         g = after.guild
+        if not await db.should_archive(g.id, 0, after.id):
+            return
         if before.nick != after.nick:
             await db.set_member_nick(g.id, after.id, after.nick)
             await db.add_history(after.id, g.id, "nickname", before.nick, after.nick)
             await asyncio.sleep(1.5)
-            e = self.find_recent("member_update", target=after.id, key="nick", max_age=15)
-            by = f"<@{e['actor']}>" if e and e["actor"] else "themselves"
+            e = self.find_recent("member_update", guild_id=g.id, target=after.id, key="nick", max_age=15)
+            by = f"<@{e['actor']}> (matching audit entry)" if e and e["actor"] else "unknown"
             emb = discord.Embed(title="🏷️ Nickname changed", color=discord.Color.blurple(), timestamp=now_utc(),
                                 description=f"{after.mention} (`{after.id}`)\n`{before.nick}` → `{after.nick}`")
             emb.add_field(name="Changed by", value=by)
-            await self.send_log(g.id, "members", embed=emb)
+            await self.send_log(g.id, "members", _subject_id=after.id, embed=emb)
         # fallback only: without View Audit Log we can't say who did it, but still record the change
         if set(before.roles) != set(after.roles) and not g.me.guild_permissions.view_audit_log:
             add = [r.mention for r in after.roles if r not in before.roles]
@@ -787,30 +1034,33 @@ class Guardian(commands.Cog):
             if rem:
                 emb.add_field(name="Removed", value=", ".join(rem))
             emb.set_footer(text="Give the bot View Audit Log to see who did it")
-            await self.send_log(g.id, "roles", embed=emb)
+            await self.send_log(g.id, "roles", _subject_id=after.id, embed=emb)
 
     # ------------------------------------------------------------ voice
     @commands.Cog.listener()
     async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
         g = member.guild
+        if not await db.should_archive(g.id, 0, member.id):
+            return
         b, a = before.channel, after.channel
         if b != a:
             if b and a:
                 await asyncio.sleep(1.5)
-                e = self.consume("member_move", channel=a.id)
+                # Discord's aggregate move entries do not identify each moved member.
+                e = None
                 emb = discord.Embed(title="🎤 Voice: moved", color=discord.Color.teal(), timestamp=now_utc(),
                                     description=f"{member.mention} (`{member.id}`)\n{b.mention} → {a.mention}")
-                emb.add_field(name="Moved by", value=f"<@{e['actor']}>" if e else "themselves")
+                emb.add_field(name="Moved by", value="unknown (Discord does not identify the member in move audit entries)")
             elif a:
                 emb = discord.Embed(title="🎤 Voice: joined", color=discord.Color.green(), timestamp=now_utc(),
                                     description=f"{member.mention} (`{member.id}`) → {a.mention}")
             else:
                 await asyncio.sleep(1.5)
-                e = self.consume("member_disconnect")
+                e = None
                 emb = discord.Embed(title="🎤 Voice: left", color=discord.Color.dark_grey(), timestamp=now_utc(),
                                     description=f"{member.mention} (`{member.id}`) ← {b.mention}")
-                emb.add_field(name="Disconnected by", value=f"<@{e['actor']}>" if e else "themselves / connection lost")
-            await self.send_log(g.id, "voice", embed=emb)
+                emb.add_field(name="Disconnected by", value="unknown (self, connection loss, or moderator)")
+            await self.send_log(g.id, "voice", _subject_id=member.id, embed=emb)
             return
         if a is None:
             return
@@ -820,7 +1070,7 @@ class Guardian(commands.Cog):
         if before.self_video != after.self_video:
             notes.append("camera on 📷" if after.self_video else "camera off")
         if notes:
-            await self.send_log(g.id, "voice", embed=discord.Embed(
+            await self.send_log(g.id, "voice", _subject_id=member.id, embed=discord.Embed(
                 title="🎤 Voice activity", color=discord.Color.teal(), timestamp=now_utc(),
                 description=f"{member.mention} {', '.join(notes)} in {a.mention}"))
 
@@ -843,7 +1093,7 @@ class Guardian(commands.Cog):
         act = entry.action.name
         before, after = dict(iter(entry.before)), dict(iter(entry.after))
         extra = entry.extra
-        rec = {"ts": time.monotonic(), "action": act, "actor": entry.user_id, "target": target_id_of(entry),
+        rec = {"guild_id": entry.guild.id, "ts": time.monotonic(), "action": act, "actor": entry.user_id, "target": target_id_of(entry),
                "channel": getattr(getattr(extra, "channel", None), "id", None),
                "left": getattr(extra, "count", 1) or 1, "keys": set(before) | set(after)}
         self.audit_buf.append(rec)
@@ -912,8 +1162,7 @@ class Guardian(commands.Cog):
                  "`-d` delete · `-u` users (mentions/IDs/names, or `all`) · "
                  "`-t` time (`30m` `1H` `2d` `1w` `6mo` `1y` `1d12h` or `all`) · "
                  "`-c` channels (omit = this channel, `all` = every channel)")
-        owner = await self.is_owner(ctx.author)
-        if not owner and not ctx.author.guild_permissions.manage_messages:
+        if not ctx.author.guild_permissions.manage_messages:
             return await ctx.send("~_~ You need **Manage Messages** for that.")
         flags = parse_flags(raw)
         if "d" not in flags:
@@ -961,8 +1210,8 @@ class Guardian(commands.Cog):
         usable, skipped = [], []
         for ch in channels:
             me_p, u_p = ch.permissions_for(ctx.guild.me), ch.permissions_for(ctx.author)
-            if not owner and not u_p.manage_messages:
-                skipped.append(f"{ch.mention} (you lack Manage Messages)")
+            if not (u_p.view_channel and u_p.read_message_history and u_p.manage_messages):
+                skipped.append(f"{ch.mention} (you lack channel access / history / Manage Messages)")
             elif not (me_p.view_channel and me_p.read_message_history and me_p.manage_messages):
                 skipped.append(f"{ch.mention} (bot lacks permissions)")
             else:
@@ -984,11 +1233,32 @@ class Guardian(commands.Cog):
         else:
             status = await ctx.send("⏳ Deleting…")
 
+        actor = ctx.author
+
         def check(m: discord.Message) -> bool:
-            return m.id != status.id and (user_ids is None or m.author.id in user_ids)
+            member = ctx.guild.get_member(m.author.id)
+            hierarchy_ok = member is None or member.id == actor.id or can_moderate(actor, member, ctx.guild)
+            return hierarchy_ok and m.id != status.id and (user_ids is None or m.author.id in user_ids)
 
         total, per_channel = 0, []
         for ch in usable:
+            # A confirmation may remain open while the moderator's roles or
+            # channel permissions change. Recheck authority at execution.
+            try:
+                actor = await ctx.guild.fetch_member(ctx.author.id)
+            except discord.HTTPException:
+                skipped.append(f"{ch.mention} (could not confirm your membership)")
+                break
+            current_channel = ctx.guild.get_channel_or_thread(ch.id)
+            if current_channel is None:
+                skipped.append(f"{ch.mention} (channel no longer available)")
+                continue
+            ch = current_channel
+            me_p, u_p = ch.permissions_for(ctx.guild.me), ch.permissions_for(actor)
+            if not (u_p.view_channel and u_p.read_message_history and u_p.manage_messages
+                    and me_p.view_channel and me_p.read_message_history and me_p.manage_messages):
+                skipped.append(f"{ch.mention} (permissions changed)")
+                continue
             self.purging.add(ch.id)
             try:
                 deleted = await ch.purge(limit=None, after=cutoff, check=check, bulk=True)
@@ -1012,43 +1282,121 @@ class Guardian(commands.Cog):
                             content=f"🧹 {ctx.author.mention} ran `!alarmbot {raw[:300]}` - {total} deleted.")
 
     # ------------------------------------------------------------ compromised accounts
+    def can_receive_security(self, source_gid: int, target_gid: int) -> bool:
+        return source_gid == target_gid or (
+            target_gid in self.network_enabled and (target_gid, source_gid) in self.trusted_sources)
+
+    async def security_allowed(self, source_gid: int, target_gid: int) -> bool:
+        return self.can_receive_security(source_gid, target_gid)
+
+    async def publish_security_alert(self, source_gid: int, content: str, *, source="security", include_source=False):
+        """Forward security-only summaries to explicitly trusting recipients."""
+        for guild in self.bot.guilds:
+            if guild.id == source_gid and not include_source:
+                continue
+            if self.can_receive_security(source_gid, guild.id):
+                await self.send_log(guild.id, "security", content=(
+                    f"Security signal from server `{source_gid}` ({short(source, 40)}):\n{short(content, 1700)}"))
+
+    def applicable_flags(self, uid: int, gid: int):
+        now = now_utc()
+        return [flag for (source_gid, user_id), flag in self.flagged.items()
+                if user_id == uid and self.can_receive_security(source_gid, gid)
+                and (gid, source_gid, uid) not in self.exempt
+                and (self.flag_expiry(flag) is None or self.flag_expiry(flag) > now)]
+
     def flag_applies(self, uid: int, gid: int):
-        f = self.flagged.get(uid)
-        if not f or gid in self.exempt.get(uid, ()):
-            return None
-        if gid != f["source_guild_id"] and gid in self.protect_off:
-            return None
-        return f
+        flags = self.applicable_flags(uid, gid)
+        return max(flags, key=lambda f: self.flag_expiry(f) or datetime.max.replace(tzinfo=UTC), default=None)
+
+    def pattern_applies(self, pattern, gid: int):
+        source_gid = pattern["source_guild_id"]
+        flag = self.flagged.get((source_gid, pattern["user_id"]))
+        return (flag is not None and self.can_receive_security(source_gid, gid)
+                and (gid, source_gid, pattern["user_id"]) not in self.exempt
+                and (gid, pattern["id"]) not in self.pattern_exempt
+                and (self.flag_expiry(flag) is None or self.flag_expiry(flag) > now_utc()))
 
     @staticmethod
     def flag_expiry(flag) -> Optional[datetime]:
         return datetime.fromisoformat(flag["expires_at_utc"]) if flag["expires_at_utc"] else None
 
-    async def apply_timeout(self, guild: discord.Guild, uid: int, expires: Optional[datetime], reason: str) -> str:
-        member = guild.get_member(uid)
-        if not member:
-            return "not a member"
+    async def apply_timeout(self, guild, uid, expires, reason, source_gid=None):
+        flag = self.flag_applies(uid, guild.id)
+        source_gid = source_gid if source_gid is not None else (flag["source_guild_id"] if flag else guild.id)
+        if not self.can_receive_security(source_gid, guild.id) or (guild.id, source_gid, uid) in self.exempt:
+            return "not accepted by this server"
+        if guild.id in self.report_only:
+            return "report only; no timeout applied"
         me = guild.me
         if not me.guild_permissions.moderate_members:
             return "bot lacks Moderate Members"
-        if member.guild_permissions.administrator or member.id == guild.owner_id or member.top_role >= me.top_role:
-            return "can't time out (admin / role hierarchy)"
-        cap = now_utc() + MAX_TIMEOUT
-        until = min(expires, cap) if expires else cap
-        try:
-            await member.timeout(until, reason=f"Compromised-account protection: {reason}"[:500])
+        until = min(expires, now_utc() + MAX_TIMEOUT) if expires else now_utc() + MAX_TIMEOUT
+        if until <= now_utc():
+            return "flag expired"
+        async with self._timeout_locks.setdefault((guild.id, uid), asyncio.Lock()):
+            # Cached member state can lag a moderator's edit. Read Discord before
+            # recording the prior timeout so we can restore the real value.
+            try:
+                member = await guild.fetch_member(uid)
+            except discord.NotFound:
+                return "not a member"
+            except discord.HTTPException as exc:
+                return f"failed to refresh member ({exc.status})"
+            if member.guild_permissions.administrator or member.id == guild.owner_id or member.top_role >= me.top_role:
+                return "cannot time out (administrator / role hierarchy)"
+            current = member.timed_out_until
+            if current and current >= until - timedelta(seconds=1):
+                return "existing timeout retained"
+            record = await store.timeout_record(guild.id, uid)
+            previous = record["previous_until"] if record and same_timeout(current, record["applied_until"]) else (
+                current.isoformat() if current and current > now_utc() else None)
+            try:
+                await member.timeout(until, reason=f"Compromised-account protection: {reason}"[:500])
+            except discord.HTTPException as exc:
+                return f"failed ({exc.status})"
+            await store.save_timeout(guild.id, uid, source_gid, previous, until.isoformat())
             return "timed out"
-        except discord.HTTPException as e:
-            return f"failed ({e.status})"
 
-    @commands.command(name="compromised", aliases=["hacked"])
+    async def release_owned_timeout(self, guild, uid):
+        """Restore only our unchanged timeout, preserving all unrelated moderation."""
+        async with self._timeout_locks.setdefault((guild.id, uid), asyncio.Lock()):
+            record = await store.timeout_record(guild.id, uid)
+            if not record or (guild.id not in self.report_only and self.flag_applies(uid, guild.id)):
+                return False
+            if not guild.me.guild_permissions.moderate_members:
+                return False
+            try:
+                member = await guild.fetch_member(uid)
+            except discord.NotFound:
+                await store.remove_timeout(guild.id, uid)
+                return False
+            except discord.HTTPException:
+                return False
+            if not same_timeout(member.timed_out_until, record["applied_until"]):
+                # Someone else changed the timeout after us. It is theirs now.
+                await store.remove_timeout(guild.id, uid)
+                return False
+            previous = datetime.fromisoformat(record["previous_until"]) if record["previous_until"] else None
+            if previous and previous <= now_utc():
+                previous = None
+            try:
+                await member.timeout(previous, reason="Guardian flag ended; restoring prior timeout")
+            except discord.HTTPException:
+                return False
+            await store.remove_timeout(guild.id, uid)
+            return True
+
+    @commands.hybrid_command(name="compromised", aliases=["hacked"])
     @commands.guild_only()
-    @commands.has_permissions(manage_messages=True, moderate_members=True)
+    @commands.has_guild_permissions(manage_messages=True, moderate_members=True)
     async def compromised(self, ctx, user: Optional[discord.User] = None, duration: str = "24h",
                           *, reason: str = "Account compromised"):
-        """Reply to a bad message with `!compromised [24h|7d|perm] [reason]`, or `!compromised @user 7d spam`."""
+        """Flag a local account; replying confirms that message as scam evidence."""
+        if getattr(ctx, "interaction", None):
+            await ctx.defer(ephemeral=True)
         target_msg = None
-        ref = ctx.message.reference
+        ref = getattr(ctx.message, "reference", None)
         if ref and ref.message_id:
             try:
                 target_msg = await ctx.channel.fetch_message(ref.message_id)
@@ -1057,282 +1405,248 @@ class Guardian(commands.Cog):
         if user is None and target_msg:
             user = target_msg.author
         if user is None:
-            return await ctx.send("Reply to the compromised account's message with `!compromised`, "
-                                  "or use `!compromised @user [24h|7d|perm] [reason]`.")
-        owner = await self.is_owner(ctx.author)
-        if user.bot or user.id in (ctx.author.id, self.bot.user.id):
-            return await ctx.send("~_~ Can't flag that account.")
-        if not owner and ctx.guild.get_member(user.id) is None:
-            return await ctx.send("~_~ That user must be a member of this server to be flagged from here.")
-
+            return await ctx.send("Reply to confirmed scam evidence with `!compromised`, or use "
+                                  "`!compromised @user [24h|7d|perm] [reason]`. No patterns are learned without a reply.")
+        member = ctx.guild.get_member(user.id)
+        if user.bot or not can_moderate(ctx.author, member, ctx.guild):
+            return await ctx.send("You can only flag a current member below your role in this server; "
+                                  "you cannot flag yourself or the server owner.")
+        if target_msg and target_msg.author.id != user.id:
+            return await ctx.send("The replied message must belong to the account you are flagging.")
         if duration.lower() in ("perm", "permanent", "manual"):
             expires = None
         else:
             span = parse_span(duration)
             if span in (None, "all"):
-                return await ctx.send("~_~ Duration looks like `24h`, `7d`, `2w` or `perm` (until you clear it).")
+                return await ctx.send("Duration must be like `24h`, `7d`, `2w`, or `perm`.")
             expires = now_utc() + span
-
-        await db.flag_user(user.id, ctx.author.id, ctx.guild.id, reason[:300], expires.isoformat() if expires else None)
-
-        since = (now_utc() - timedelta(hours=1)).isoformat()
-        rows = await db.recent_messages_by_author(user.id, since, 200)
-        seen, made = set(), 0
-        for r in rows:
-            shas = {a["sha256"] for a in await db.get_attachments(r["message_id"]) if a["sha256"]}
-            doms = domains_of(r["content"])
-            key = (r["content_hash"], frozenset(doms), frozenset(shas))
-            if key in seen or not (r["content_hash"] or doms or shas) or made >= 10:
-                continue
-            seen.add(key)
-            made += 1
-            await db.add_fingerprint(user.id, r["content_hash"], ",".join(doms), ",".join(shas),
-                                     norm_text(r["content"])[:500])
-        if target_msg and not any(r["message_id"] == target_msg.id for r in rows):
-            h, doms = text_hash(target_msg.content), domains_of(target_msg.content)
-            if h or doms:
-                await db.add_fingerprint(user.id, h, ",".join(doms), "", norm_text(target_msg.content)[:500])
-        await self.refresh_cache()
-
-        deleted = 0
-        for r in rows:
-            ch = self.bot.get_channel(r["channel_id"])
-            if not ch or not getattr(ch, "guild", None) or not self.flag_applies(user.id, ch.guild.id):
-                continue
-            self.silent_ids.add(r["message_id"])
-            try:
-                await ch.get_partial_message(r["message_id"]).delete()
-                deleted += 1
-            except discord.HTTPException:
-                self.silent_ids.discard(r["message_id"])
+        await store.flag(ctx.guild.id, user.id, ctx.author.id, reason[:300], expires.isoformat() if expires else None)
+        made = 0
         if target_msg:
-            self.silent_ids.add(target_msg.id)
-            try:
-                await target_msg.delete()
-            except discord.HTTPException:
-                self.silent_ids.discard(target_msg.id)
-        await db.mark_deleted([r["message_id"] for r in rows])
-
-        applied, details = 0, []
-        for g in self.bot.guilds:
-            if not g.get_member(user.id) or not self.flag_applies(user.id, g.id):
-                continue
-            res = await self.apply_timeout(g, user.id, expires, reason)
-            applied += res == "timed out"
-            details.append((g, res))
-            emb = discord.Embed(title="🚨 Compromised account flagged", color=discord.Color.dark_red(), timestamp=now_utc(),
-                                description=f"{user.mention} (`{user.id}`)\n**Reason:** {reason}")
-            emb.add_field(name="Flagged by", value=f"{ctx.author} in **{ctx.guild.name}**")
-            emb.add_field(name="Until", value=f"<t:{int(expires.timestamp())}:R>" if expires else "cleared manually")
-            emb.add_field(name="Result here", value=res)
-            await self.send_log(g.id, "security", embed=emb)
-
-        out = discord.Embed(title="🚨 Account flagged network-wide", color=discord.Color.dark_red(),
-                            description=f"{user.mention} (`{user.id}`)")
-        out.add_field(name="Timed out", value=f"{applied} server(s)")
-        out.add_field(name="Messages removed", value=str(deleted))
-        out.add_field(name="Fingerprints", value=f"{made} scam pattern(s) now blocked")
-        out.add_field(name="Ends", value=f"<t:{int(expires.timestamp())}:R>" if expires else "when you run `!uncompromised`")
-        if owner:
-            out.add_field(name="Per server", value="\n".join(f"{g.name}: {r}" for g, r in details)[:1000] or "-", inline=False)
-        else:
-            fails = sum(1 for _, r in details if r != "timed out")
-            if fails:
-                out.set_footer(text=f"{fails} server(s) couldn't be timed out (permissions/hierarchy) - messages are still auto-deleted there.")
-        await ctx.send(embed=out)
-
-    @commands.command(name="uncompromised", aliases=["clearflag"])
-    @commands.guild_only()
-    @commands.has_permissions(manage_messages=True, moderate_members=True)
-    async def uncompromised(self, ctx, user: discord.User):
-        """Source server (or bot owner): clears the flag everywhere. Other servers: clears it for themselves only."""
-        flag = await db.get_flag(user.id)
-        if not flag:
-            return await ctx.send("That account isn't flagged.")
-        owner = await self.is_owner(ctx.author)
-        if owner or flag["source_guild_id"] == ctx.guild.id:
-            await db.clear_flag(user.id)
-            await self.refresh_cache()
-            lifted = 0
-            for g in self.bot.guilds:
-                m = g.get_member(user.id)
-                if m and m.is_timed_out() and g.me.guild_permissions.moderate_members:
+            shas = {a["sha256"] for a in await db.get_attachments(target_msg.id) if a["sha256"]}
+            # Evidence may not be archived, so hash selected attachments within a fixed byte budget.
+            remaining = MAX_READ_BYTES
+            for attachment in target_msg.attachments:
+                if attachment.size <= remaining:
                     try:
-                        await m.timeout(None, reason="Compromised flag cleared")
-                        lifted += 1
+                        evidence = await attachment.read()
                     except discord.HTTPException:
-                        pass
-            return await ctx.send(f"✅ {user.mention} cleared everywhere. Timeouts lifted in {lifted} server(s).")
-        await db.add_exempt(ctx.guild.id, user.id)
+                        continue
+                    remaining -= len(evidence)
+                    shas.add(hashlib.sha256(evidence).hexdigest())
+                    del evidence
+            content_hash, urls = text_hash(target_msg.content), urls_of(target_msg.content)
+            if content_hash or urls or shas:
+                await store.add_pattern(ctx.guild.id, user.id, content_hash, urls, shas,
+                                        norm_text(target_msg.content), target_msg.id)
+                made = 1
         await self.refresh_cache()
-        m = ctx.guild.get_member(user.id)
-        if m and m.is_timed_out():
-            try:
-                await m.timeout(None, reason="Compromised flag cleared locally")
-            except discord.HTTPException:
-                pass
-        await ctx.send(f"✅ {user.mention} is exempt in **this** server. The flag stays active in the server that raised it.")
+        deleted_ids = []
+        # Historical cleanup is strictly local. Trusted receivers apply their own incoming-message policy.
+        rows = await db.recent_messages_by_author(user.id, (now_utc() - timedelta(hours=1)).isoformat(), 200,
+                                                 guild_id=ctx.guild.id)
+        if target_msg and not any(row["message_id"] == target_msg.id for row in rows):
+            rows.append({"message_id": target_msg.id, "channel_id": ctx.channel.id, "guild_id": ctx.guild.id})
+        if ctx.guild.id not in self.report_only:
+            for row in rows:
+                channel = ctx.guild.get_channel_or_thread(row["channel_id"])
+                if not channel:
+                    continue
+                perms = channel.permissions_for(ctx.author)
+                if not (perms.view_channel and perms.manage_messages):
+                    continue
+                self.silent_ids.add(row["message_id"])
+                try:
+                    await channel.get_partial_message(row["message_id"]).delete()
+                except discord.HTTPException:
+                    self.silent_ids.discard(row["message_id"])
+                    continue
+                deleted_ids.append(row["message_id"])
+            await db.mark_deleted(deleted_ids)
+        local_result = "not applied"
+        for guild in self.bot.guilds:
+            # Existing flags from a different source must not expose this
+            # command's reason to a server that never trusted its source.
+            if not self.can_receive_security(ctx.guild.id, guild.id) or (guild.id, ctx.guild.id, user.id) in self.exempt:
+                continue
+            flag = self.flag_applies(user.id, guild.id)
+            if not flag or not guild.get_member(user.id):
+                continue
+            result = await self.apply_timeout(guild, user.id, self.flag_expiry(flag), flag["reason"], flag["source_guild_id"])
+            if guild.id == ctx.guild.id:
+                local_result = result
+            await self.send_log(guild.id, "security", content=(
+                f"Compromised account `{user.id}` flagged by source server `{ctx.guild.id}`. "
+                f"Reason: {short(reason, 300)}. Result here: {result}."))
+        await ctx.send(f"Flag saved for `{user.id}`. Local result: **{local_result}**. "
+                       f"Removed {len(deleted_ids)} local message(s); learned {made} confirmed pattern(s). "
+                       "Only explicitly trusting servers with protection enabled can accept this security flag.")
 
-    @commands.command(name="flagged")
+    @commands.hybrid_command(name="uncompromised", aliases=["clearflag"])
     @commands.guild_only()
-    @commands.has_permissions(moderate_members=True)
-    async def flagged_list(self, ctx):
-        flags = await db.get_active_flags()
-        if not flags:
-            return await ctx.send("No active compromised-account flags.")
-        owner = await self.is_owner(ctx.author)
-        lines = []
-        for f in flags[:25]:
-            src = self.bot.get_guild(f["source_guild_id"])
-            srcname = src.name if src and (owner or src.id == ctx.guild.id) else "another server"
-            end = f"<t:{int(datetime.fromisoformat(f['expires_at_utc']).timestamp())}:R>" if f["expires_at_utc"] else "manual"
-            lines.append(f"<@{f['user_id']}> (`{f['user_id']}`) - {srcname} - ends {end} - {f['reason'][:60]}")
-        await ctx.send(embed=discord.Embed(title="🚨 Active flags", description="\n".join(lines), color=discord.Color.dark_red()))
+    @commands.has_guild_permissions(manage_messages=True, moderate_members=True)
+    async def uncompromised(self, ctx, user: discord.User):
+        """Clear this server's flag and locally exempt accepted external flags."""
+        member = ctx.guild.get_member(user.id)
+        local_flag = self.flagged.get((ctx.guild.id, user.id))
+        if member and not can_moderate(ctx.author, member, ctx.guild):
+            return await ctx.send("That account is outside your moderation role hierarchy.")
+        if member is None and local_flag is None:
+            return await ctx.send("No local member or local flag exists for that account.")
+        flags = self.applicable_flags(user.id, ctx.guild.id)
+        if not flags and not local_flag:
+            return await ctx.send("No active flag applies to that account here.")
+        if local_flag:
+            await store.clear_flag(ctx.guild.id, user.id)
+        for flag in flags:
+            if flag["source_guild_id"] != ctx.guild.id:
+                await store.exempt(ctx.guild.id, flag["source_guild_id"], user.id)
+        await self.refresh_cache()
+        for guild in self.bot.guilds:
+            if guild.id == ctx.guild.id or (local_flag and self.can_receive_security(ctx.guild.id, guild.id)):
+                await self.release_owned_timeout(guild, user.id)
+        await ctx.send(f"Cleared this server's flag for `{user.id}` and ignored currently accepted external flags here. "
+                       "Only unchanged timeouts owned by Guardian can be restored.")
 
-    async def enforce(self, message: discord.Message, shas: set):
+    @commands.hybrid_command(name="flagged")
+    @commands.guild_only()
+    @commands.has_guild_permissions(moderate_members=True)
+    async def flagged_list(self, ctx):
+        lines = []
+        for flag in self.flagged.values():
+            if not ctx.guild.get_member(flag["user_id"]) or flag not in self.applicable_flags(flag["user_id"], ctx.guild.id):
+                continue
+            expires = self.flag_expiry(flag)
+            end = f"<t:{int(expires.timestamp())}:R>" if expires else "manual clearance"
+            lines.append(f"`{flag['user_id']}` · source `{flag['source_guild_id']}` · {end} · {short(flag['reason'], 80)}")
+        await self.private_response(ctx, embed=discord.Embed(title="Security flags applicable here",
+            description="\n".join(lines[:25]) or "None.", color=discord.Color.dark_red()))
+
+    async def enforce(self, message, shas: set):
         uid, gid = message.author.id, message.guild.id
-        reason = None
-        if self.flag_applies(uid, gid):
-            reason = "flagged compromised account"
-        elif self.fp_cache and gid not in self.protect_off and not message.author.guild_permissions.manage_messages:
-            reason = self.match_fingerprint(message, shas)
+        flag = self.flag_applies(uid, gid)
+        reason = "flagged compromised account" if flag else self.match_fingerprint(message, shas)
         if not reason:
-            return
+            return False
+        if gid in self.report_only:
+            key = (gid, message.id)
+            if key not in self._notice_times:
+                self._notice_times[key] = time.monotonic()
+                await self.send_log(gid, "security", content=(
+                    f"Report only: message `{message.id}` from `{uid}` in {message.channel.mention}: {reason}. No action taken."))
+            return False
+        # Respect Discord's protected roles even for automatic security actions.
+        member = message.author
+        if member.id == message.guild.owner_id or member.guild_permissions.administrator or member.top_role >= message.guild.me.top_role:
+            return False
         self.silent_ids.add(message.id)
         try:
             await message.delete()
         except discord.HTTPException:
             self.silent_ids.discard(message.id)
-            return
-        if reason == "flagged compromised account" and not message.author.is_timed_out():
-            f = self.flagged[uid]
-            await self.apply_timeout(message.guild, uid, self.flag_expiry(f), f["reason"])
-        await self.send_log(gid, "security",
-                            content=f"🛡️ Deleted a message from {message.author.mention} in {message.channel.mention} - {reason}.")
+            return False
+        await db.mark_deleted([message.id])
+        if flag:
+            await self.apply_timeout(message.guild, uid, self.flag_expiry(flag), flag["reason"], flag["source_guild_id"])
+        await self.send_log(gid, "security", content=(
+            f"Deleted message `{message.id}` from `{uid}` in {message.channel.mention}: {reason}."))
+        return True
 
-    def match_fingerprint(self, message: discord.Message, shas: set) -> Optional[str]:
-        h, norm, doms = text_hash(message.content), norm_text(message.content)[:500], domains_of(message.content)
-        for fp in self.fp_cache:
-            if fp["user_id"] == message.author.id:
+    def match_fingerprint(self, message, shas: set) -> Optional[str]:
+        content_hash, urls = text_hash(message.content), urls_of(message.content)
+        for pattern in self.fp_cache:
+            if not self.pattern_applies(pattern, message.guild.id):
                 continue
-            if h and h == fp["hash"]:
-                return "matches a flagged scam message"
-            if doms & fp["domains"]:
-                return "contains a flagged scam link"
-            if shas & fp["shas"]:
-                return "contains a flagged scam image"
-            if len(norm) >= 25 and len(fp["norm"]) >= 25:
-                sm = SequenceMatcher(None, norm, fp["norm"])
-                if sm.quick_ratio() >= 0.9 and sm.ratio() >= 0.9:
-                    return "near-duplicate of a flagged scam message"
+            if content_hash and content_hash == pattern["hash"]:
+                return f"matches confirmed scam text (pattern {pattern['id']})"
+            if urls & pattern["urls"]:
+                return f"contains a confirmed scam URL (pattern {pattern['id']})"
+            if shas & pattern["shas"]:
+                return f"contains a confirmed scam attachment (pattern {pattern['id']})"
         return None
 
     @tasks.loop(seconds=60)
     async def enforce_loop(self):
         try:
-            for uid in await db.expire_flags():
-                for g in self.bot.guilds:
-                    m = g.get_member(uid)
-                    if m and m.is_timed_out() and g.me.guild_permissions.moderate_members:
-                        try:
-                            await m.timeout(None, reason="Compromised flag expired")
-                        except discord.HTTPException:
-                            pass
+            await store.expire_flags()
             await self.refresh_cache()
-            now = now_utc()
-            cap = now + MAX_TIMEOUT
-            for uid, f in self.flagged.items():
-                exp = self.flag_expiry(f)
-                for g in self.bot.guilds:
-                    m = g.get_member(uid)
-                    if not m or not self.flag_applies(uid, g.id):
+            for record in await db._all("SELECT * FROM guardian_timeouts"):
+                guild = self.bot.get_guild(record["guild_id"])
+                if guild:
+                    await self.release_owned_timeout(guild, record["user_id"])
+            for guild in self.bot.guilds:
+                for uid in {flag["user_id"] for flag in self.flagged.values()}:
+                    member = guild.get_member(uid)
+                    flag = self.flag_applies(uid, guild.id)
+                    if member is None or flag is None:
                         continue
-                    tu = m.timed_out_until
-                    if exp and exp <= cap:
-                        need = tu is None or tu < exp - timedelta(seconds=90)
-                    else:
-                        need = tu is None or tu < now + timedelta(days=7)
-                    if need:
-                        await self.apply_timeout(g, uid, exp, f["reason"])
-        except Exception as e:
-            print(f"[guardian] enforce loop error: {e}")
+                    expires = self.flag_expiry(flag)
+                    desired = min(expires, now_utc() + MAX_TIMEOUT) if expires else now_utc() + MAX_TIMEOUT
+                    if member.timed_out_until is None or member.timed_out_until < desired - timedelta(minutes=5):
+                        await self.apply_timeout(guild, uid, expires, flag["reason"], flag["source_guild_id"])
+            self._notice_times = {key: stamp for key, stamp in self._notice_times.items() if time.monotonic() - stamp < 300}
+            self.silent_ids.clear()
+        except Exception as exc:
+            print(f"[guardian] enforce loop error: {exc}")
 
     @enforce_loop.before_loop
     async def _before_enforce(self):
         await self.bot.wait_until_ready()
 
-    @tasks.loop(hours=6)
-    async def retention_loop(self):
-        if RETENTION_DAYS > 0:
-            try:
-                await db.prune_messages((now_utc() - timedelta(days=RETENTION_DAYS)).isoformat())
-            except Exception as e:
-                print(f"[guardian] retention error: {e}")
+    async def private_response(self, ctx, **kwargs):
+        kwargs.setdefault("allowed_mentions", discord.AllowedMentions.none())
+        if getattr(ctx, "interaction", None):
+            return await ctx.send(ephemeral=True, **kwargs)
+        try:
+            await ctx.author.send(**kwargs)
+        except discord.HTTPException:
+            return await ctx.send("I could not send your private result. Enable DMs or use the slash command.")
+        await ctx.send("Sent the result privately.", delete_after=10)
 
-    # ------------------------------------------------------------ userinfo / alt check
-    @commands.command(name="userinfo", aliases=["whois", "trace"])
+    # ------------------------------------------------------------ strictly local investigation
+    @commands.hybrid_command(name="userinfo", aliases=["whois", "trace"])
     @commands.guild_only()
-    @commands.has_permissions(moderate_members=True)
+    @commands.has_guild_permissions(moderate_members=True)
     async def userinfo(self, ctx, user: discord.User):
-        owner = await self.is_owner(ctx.author)
-        await db.upsert_profile(self.profile_dict(user))
-        snap = await self.mirror_avatar(user, ctx.guild.id)
-        prof = await db.get_profile(user.id)
-
-        emb = discord.Embed(title=f"🔎 {user}", color=discord.Color.blurple(), timestamp=now_utc())
-        emb.set_thumbnail(url=user.display_avatar.url)
-        emb.add_field(name="ID", value=f"`{user.id}`")
-        emb.add_field(name="Account created", value=f"<t:{int(user.created_at.timestamp())}:F>")
-        emb.add_field(name="First seen by bot", value=prof["first_seen_utc"][:10] if prof else "-")
-        emb.add_field(name="Avatar", value=f"[snapshot]({snap})" if snap else "default")
-        emb.add_field(name="Messages archived here", value=str(await db.count_messages(user.id, ctx.guild.id)))
-        flag = await db.get_flag(user.id)
+        member = ctx.guild.get_member(user.id)
+        if member is None:
+            return await ctx.send("Choose a current member of this server.")
+        if getattr(ctx, "interaction", None):
+            await ctx.defer(ephemeral=True)
+        emb = discord.Embed(title=f"Member information: {member}", color=discord.Color.blurple(), timestamp=now_utc())
+        emb.set_thumbnail(url=member.display_avatar.url)
+        emb.add_field(name="ID", value=f"`{member.id}`")
+        emb.add_field(name="Account created", value=f"<t:{int(member.created_at.timestamp())}:F>")
+        if member.joined_at:
+            emb.add_field(name="Joined this server", value=f"<t:{int(member.joined_at.timestamp())}:F>")
+        emb.add_field(name="Nickname here", value=short(member.nick or "none", 100))
+        flag = self.flag_applies(member.id, ctx.guild.id)
         if flag:
-            emb.add_field(name="🚨 Flagged", value=flag["reason"][:100])
-
-        hist = await db.get_history(user.id, None if owner else ctx.guild.id, 12)
-        if hist:
-            lines = []
-            for h in hist:
-                extra = f" [view]({h['mirror_url']})" if h.get("mirror_url") else ""
-                lines.append(f"`{h['changed_at_utc'][:10]}` {h['kind']}: `{h['old_value']}` → `{h['new_value']}`{extra}")
-            emb.add_field(name="Name / nickname / avatar history", value="\n".join(lines)[:1000], inline=False)
-
-        mem_lines = []
-        for m in await db.get_memberships(user.id):
-            g = self.bot.get_guild(m["guild_id"])
-            if not g or not (owner or g.get_member(ctx.author.id)):
-                continue
-            left = " (left)" if m["left_at_utc"] else ""
-            inv = f" via `{m['invite_code']}`" if m["invite_code"] else ""
-            mem_lines.append(f"**{g.name}**{left} nick: `{m['nickname']}` joined {str(m['joined_at_utc'])[:10]}{inv}")
-        if mem_lines:
-            emb.add_field(name="Servers" if owner else "Servers (that you're also in)",
-                          value="\n".join(mem_lines)[:1000], inline=False)
-
-        events = await db.get_audit_events(user.id, ctx.guild.id, 6)
-        if events:
-            lines = []
-            for ev in events:
-                role = "by" if ev["actor_id"] == user.id else "on"
-                other = ev["target_id"] if role == "by" else ev["actor_id"]
-                lines.append(f"`{ev['created_at_utc'][:10]}` {ev['action'].replace('_', ' ')} ({role} them" +
-                             (f", other: <@{other}>" if other else "") + ")")
-            emb.add_field(name="Recent staff actions here", value="\n".join(lines)[:1000], inline=False)
-
-        signals = await db.alt_signals(user.id)
-        scored = sorted(((sum(w for _, w in r), uid, r) for uid, r in signals.items()), reverse=True)
-        alt_lines = []
-        for score, uid, reasons in scored:
-            if score < 25 or len(alt_lines) >= 6:
-                break
-            label = "strong" if score >= 60 else "likely" if score >= 35 else "weak"
-            p = await db.get_profile(uid)
-            alt_lines.append(f"<@{uid}> (`{uid}`, {p['username'] if p else '?'}) - **{label}** ({score}): " +
-                             "; ".join(r for r, _ in reasons))
-        emb.add_field(name="Possible alternate accounts (heuristic, not proof)",
-                      value="\n".join(alt_lines)[:1000] if alt_lines else "Nothing notable.", inline=False)
-        await ctx.send(embed=emb)
+            emb.add_field(name="Applicable security flag", value=short(flag["reason"], 100))
+        if await db.should_archive(ctx.guild.id, 0, member.id):
+            emb.add_field(name="Messages archived here", value=str(await db.count_messages(member.id, ctx.guild.id)))
+            history = await db.get_history(member.id, ctx.guild.id, 12)
+            if history:
+                lines = [f"`{row['changed_at_utc'][:10]}` {row['kind']}: "
+                         f"{short(row['old_value'], 70)} → {short(row['new_value'], 70)}" for row in history]
+                emb.add_field(name="History observed in this server", value="\n".join(lines)[:1000], inline=False)
+            events = await db.get_audit_events(member.id, ctx.guild.id, 6)
+            if events:
+                lines = [f"`{row['created_at_utc'][:10]}` {row['action'].replace('_', ' ')}" for row in events]
+                emb.add_field(name="Staff actions in this server", value="\n".join(lines)[:1000], inline=False)
+            signals = await db.alt_signals(member.id, ctx.guild.id)
+            matches = []
+            for uid, reasons in sorted(signals.items(), key=lambda pair: sum(weight for _, weight in pair[1]), reverse=True):
+                if ctx.guild.get_member(uid) is None or not await db.should_archive(ctx.guild.id, 0, uid):
+                    continue
+                score = sum(weight for _, weight in reasons)
+                if score >= 25:
+                    matches.append(f"`{uid}`: " + "; ".join(reason for reason, _ in reasons))
+                if len(matches) == 6:
+                    break
+            emb.add_field(name="Similarities within this server — not proof of alternate accounts",
+                          value="\n".join(matches)[:1000] or "Nothing notable.", inline=False)
+        await self.private_response(ctx, embed=emb)
 
 
 async def setup(bot: commands.Bot):

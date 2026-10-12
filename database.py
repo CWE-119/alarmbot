@@ -5,28 +5,27 @@ The SQLite file is the ONLY thing this bot writes to disk. Attachments and avata
 Discord log channels; the database stores text and the mirror URLs.
 """
 import os
+import asyncio
 import re
-import shutil
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
 
 import aiosqlite
 import pytz
+from dotenv import load_dotenv
 
 # ============================================================ configuration
 # Absolute path, independent of the launch directory. On hosts with an ephemeral disk
 # (Railway, Heroku, ...) point DATA_DIR at a persistent volume or settings are lost on restart.
+load_dotenv(Path(__file__).resolve().parent / ".env")
 DATA_DIR = Path(os.getenv("DATA_DIR") or (Path(__file__).resolve().parent / "data"))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = str(DATA_DIR / "alarm_bot.db")
-
-# one-time migration of a database created by older versions (relative path)
-for _old in (Path("alarm_bot.db"), Path(__file__).resolve().parent / "alarm_bot.db"):
-    if _old.exists() and not Path(DB_PATH).exists():
-        shutil.copy2(_old, DB_PATH)
-        break
+_connection = None
+_connection_path = None
+_connection_lock = asyncio.Lock()
 
 # ============================================================ schema
 SCHEMA = """
@@ -137,14 +136,23 @@ MIGRATIONS = (
 
 
 async def init_db():
+    default_retention()
+    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    # Only the repository's legacy database is eligible, never an arbitrary cwd file.
+    legacy = Path(__file__).resolve().parent / "alarm_bot.db"
+    if legacy.exists() and not Path(DB_PATH).exists() and not os.getenv("BOT_TESTING"):
+        with closing(sqlite3.connect(str(legacy))) as source, closing(sqlite3.connect(DB_PATH)) as target:
+            source.backup(target)
     async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         await db.execute("PRAGMA journal_mode=WAL")
         await db.executescript(SCHEMA)
         for stmt in MIGRATIONS:
             try:
                 await db.execute(stmt)
-            except sqlite3.OperationalError:
-                pass                                  # column already exists
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
+        await db.executescript(PRIVACY_SCHEMA)
         await db.commit()
 
 
@@ -161,25 +169,72 @@ def _utc_iso(dt: datetime) -> str:
 
 async def _run(sql, params=()) -> int:
     """Execute a write; returns the affected row count."""
-    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
-        cur = await db.execute(sql, params)
-        await db.commit()
-        return cur.rowcount
+    async with _connection_lock:
+        conn = await _get_connection()
+        try:
+            async with conn.execute(sql, params) as cur:
+                count = cur.rowcount
+            await conn.commit()
+            return count
+        except BaseException:
+            await conn.rollback()
+            raise
 
 
 async def _insert(sql, params=()) -> int:
     """Execute an INSERT; returns the new row id."""
-    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
-        cur = await db.execute(sql, params)
-        await db.commit()
-        return cur.lastrowid
+    async with _connection_lock:
+        conn = await _get_connection()
+        try:
+            async with conn.execute(sql, params) as cur:
+                ident = cur.lastrowid if cur.rowcount else 0
+            await conn.commit()
+            return ident
+        except BaseException:
+            await conn.rollback()
+            raise
 
 
 async def _all(sql, params=()) -> list:
-    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(sql, params) as cur:
+    async with _connection_lock:
+        conn = await _get_connection()
+        async with conn.execute(sql, params) as cur:
             return [dict(r) for r in await cur.fetchall()]
+
+
+async def _get_connection():
+    """Called under the lock: reuse one connection, serialize small transactions."""
+    global _connection, _connection_path
+    if _connection is not None and _connection_path != DB_PATH:
+        await _connection.close()
+        _connection = None
+    if _connection is None:
+        _connection = await aiosqlite.connect(DB_PATH, timeout=30)
+        _connection.row_factory = aiosqlite.Row
+        _connection_path = DB_PATH
+    return _connection
+
+
+async def close_db():
+    global _connection, _connection_path, _connection_lock
+    async with _connection_lock:
+        if _connection is not None:
+            await _connection.close()
+        _connection = _connection_path = None
+    _connection_lock = asyncio.Lock()
+
+
+async def run_transaction(statements):
+    async with _connection_lock:
+        conn = await _get_connection()
+        try:
+            await conn.execute("BEGIN IMMEDIATE")
+            for sql, params in statements:
+                await conn.execute(sql, params)
+            await conn.commit()
+        except BaseException:
+            await conn.rollback()
+            raise
 
 
 async def _one(sql, params=()):
@@ -320,18 +375,23 @@ async def add_history(user_id: int, guild_id, kind: str, old, new, mirror_url=No
     """, (user_id, guild_id, kind, old, new, mirror_url, utcnow_iso()))
 
 
-async def get_history(user_id: int, guild_id=None, limit: int = 15):
-    """guild_id=None -> everything; otherwise global rows + that guild's nickname rows."""
+async def get_history(user_id: int, guild_id: int, limit: int = 15):
+    """A guild query never returns another guild's or legacy global history."""
     if guild_id is None:
-        return await _all("SELECT * FROM profile_history WHERE user_id=? ORDER BY id DESC LIMIT ?",
-                          (user_id, limit))
-    return await _all("""SELECT * FROM profile_history WHERE user_id=? AND (guild_id IS NULL OR guild_id=?)
+        raise ValueError("A server is required for investigation history")
+    return await _all("""SELECT * FROM profile_history WHERE user_id=? AND guild_id=?
                          ORDER BY id DESC LIMIT ?""", (user_id, guild_id, limit))
 
 
-async def sync_profiles(profiles: list, members: list) -> int:
+async def sync_profiles(profiles: list, members: list, complete_guild_ids=None) -> int:
     """Startup bulk sync. Records history for anything that changed while the bot was offline."""
     now = utcnow_iso()
+    present_by_guild = {}
+    for member in members:
+        present_by_guild.setdefault(member["guild_id"], set()).add(member["user_id"])
+    members = [m for m in members if await should_archive(m["guild_id"], user_id=m["user_id"])]
+    eligible = {m["user_id"] for m in members}
+    profiles = [p for p in profiles if p["user_id"] in eligible]
     async with aiosqlite.connect(DB_PATH, timeout=60) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT user_id, username, global_name, avatar_hash FROM user_profiles") as cur:
@@ -346,7 +406,9 @@ async def sync_profiles(profiles: list, members: list) -> int:
                 continue
             for kind, key in (("username", "username"), ("global_name", "global_name"), ("avatar", "avatar_hash")):
                 if o[key] != p[key]:
-                    hist.append((p["user_id"], None, kind, o[key], p[key], None, now))
+                    for member in members:
+                        if member["user_id"] == p["user_id"]:
+                            hist.append((p["user_id"], member["guild_id"], kind, o[key], p[key], None, now))
         for m in members:
             k = (m["guild_id"], m["user_id"])
             if k in old_nick and old_nick[k] != m["nickname"]:
@@ -356,8 +418,17 @@ async def sync_profiles(profiles: list, members: list) -> int:
         await db.executemany("""
             INSERT INTO guild_members (guild_id, user_id, nickname, joined_at_utc, left_at_utc)
             VALUES (:guild_id, :user_id, :nickname, :joined, NULL)
-            ON CONFLICT(guild_id, user_id) DO UPDATE SET nickname=excluded.nickname, left_at_utc=NULL
+            ON CONFLICT(guild_id, user_id) DO UPDATE SET nickname=excluded.nickname,
+                joined_at_utc=COALESCE(excluded.joined_at_utc,guild_members.joined_at_utc), left_at_utc=NULL,
+                invite_code=CASE WHEN guild_members.joined_at_utc!=excluded.joined_at_utc THEN NULL ELSE guild_members.invite_code END,
+                inviter_id=CASE WHEN guild_members.joined_at_utc!=excluded.joined_at_utc THEN NULL ELSE guild_members.inviter_id END
         """, members)
+        # Reconcile departures only for guilds whose member cache was fully loaded.
+        for gid in complete_guild_ids or ():
+            present = present_by_guild.get(gid, set())
+            async with db.execute("SELECT user_id FROM guild_members WHERE guild_id=? AND left_at_utc IS NULL", (gid,)) as cur:
+                departed = [(now, gid, r[0]) for r in await cur.fetchall() if r[0] not in present]
+            await db.executemany("UPDATE guild_members SET left_at_utc=? WHERE guild_id=? AND user_id=?", departed)
         if hist:
             await db.executemany("""
                 INSERT INTO profile_history (user_id, guild_id, kind, old_value, new_value, mirror_url, changed_at_utc)
@@ -389,8 +460,10 @@ async def set_member_nick(guild_id: int, user_id: int, nickname):
     """, (guild_id, user_id, nickname))
 
 
-async def get_memberships(user_id: int):
-    return await _all("SELECT * FROM guild_members WHERE user_id=? ORDER BY joined_at_utc", (user_id,))
+async def get_memberships(user_id: int, guild_id: int):
+    if guild_id is None:
+        raise ValueError("A server is required for membership history")
+    return await _all("SELECT * FROM guild_members WHERE user_id=? AND guild_id=? ORDER BY joined_at_utc", (user_id, guild_id))
 
 
 # ============================================================ message archive
@@ -402,6 +475,16 @@ async def log_message(row: dict):
         VALUES (:message_id, :guild_id, :channel_id, :author_id, :author_name, :content, :reply_to_id,
                 :created_at_utc, :content_hash)
     """, row)
+
+
+async def archive_message(profile: dict, row: dict):
+    """Store one incoming message and its public profile in one transaction."""
+    await run_transaction([
+        (_PROFILE_UPSERT, {**profile, "now": utcnow_iso()}),
+        ("""INSERT OR IGNORE INTO message_log
+         (message_id,guild_id,channel_id,author_id,author_name,content,reply_to_id,created_at_utc,content_hash)
+         VALUES (:message_id,:guild_id,:channel_id,:author_id,:author_name,:content,:reply_to_id,:created_at_utc,:content_hash)""", row),
+    ])
 
 
 async def add_attachment(row: dict):
@@ -439,15 +522,17 @@ async def mark_deleted(ids: list):
 
 async def log_edit(message_id: int, old: str, new: str, new_hash):
     now = utcnow_iso()
-    await _run("INSERT INTO message_edits (message_id, old_content, new_content, edited_at_utc) VALUES (?,?,?,?)",
-               (message_id, old, new, now))
-    await _run("UPDATE message_log SET content=?, content_hash=?, edited=1 WHERE message_id=?",
-               (new, new_hash, message_id))
+    await run_transaction([
+        ("INSERT INTO message_edits (message_id, old_content, new_content, edited_at_utc) VALUES (?,?,?,?)", (message_id, old, new, now)),
+        ("UPDATE message_log SET content=?, content_hash=?, edited=1 WHERE message_id=?", (new, new_hash, message_id)),
+    ])
 
 
-async def recent_messages_by_author(author_id: int, since_iso: str, limit: int = 200):
-    return await _all("""SELECT * FROM message_log WHERE author_id=? AND deleted=0 AND created_at_utc>=?
-                         ORDER BY created_at_utc DESC LIMIT ?""", (author_id, since_iso, limit))
+async def recent_messages_by_author(author_id: int, since_iso: str, limit: int = 200, guild_id=None):
+    scope = " AND guild_id=?" if guild_id is not None else ""
+    args = (author_id, since_iso) + ((guild_id,) if guild_id is not None else ()) + (limit,)
+    return await _all("SELECT * FROM message_log WHERE author_id=? AND deleted=0 AND created_at_utc>=?" + scope +
+                      " ORDER BY created_at_utc DESC LIMIT ?", args)
 
 
 async def count_messages(author_id: int, guild_id: int) -> int:
@@ -529,71 +614,34 @@ def _canon(s) -> str:
     return re.sub(r"[^a-z]", "", (s or "").lower())
 
 
-async def alt_signals(user_id: int) -> dict:
-    """Returns {other_user_id: [(reason, weight), ...]}. Heuristics only - never proof."""
-    out: dict = {}
-
-    def add(uid, reason, w):
-        if uid == user_id:
-            return
-        if all(r != reason for r, _ in out.get(uid, [])):
-            out.setdefault(uid, []).append((reason, w))
-
-    me = await get_profile(user_id)
+async def alt_signals(user_id: int, guild_id: int) -> dict:
+    """Weak investigation clues from this guild only; never automatic punishment."""
+    me = await _one("SELECT p.* FROM user_profiles p JOIN guild_members m USING(user_id) WHERE p.user_id=? AND m.guild_id=?", (user_id, guild_id))
     if not me:
-        return out
-
-    if me["avatar_hash"]:
-        for r in await _all("SELECT user_id FROM user_profiles WHERE avatar_hash=? AND user_id!=? LIMIT 50",
-                            (me["avatar_hash"], user_id)):
-            add(r["user_id"], "same current avatar image", 40)
-
-    for r in await _all("""
-        SELECT DISTINCT h2.user_id AS uid FROM profile_history h1
-        JOIN profile_history h2 ON h2.kind='avatar' AND h2.user_id!=h1.user_id
-                               AND h2.new_value IS NOT NULL AND h2.new_value=h1.new_value
-        WHERE h1.kind='avatar' AND h1.user_id=? AND h1.new_value IS NOT NULL LIMIT 50""", (user_id,)):
-        add(r["uid"], "has used the same avatar image in the past", 30)
-
-    for r in await _all("""
-        SELECT DISTINCT a2.author_id AS uid FROM attachments a1
-        JOIN attachments a2 ON a2.sha256=a1.sha256 AND a2.author_id!=a1.author_id
-        WHERE a1.author_id=? AND a1.sha256 IS NOT NULL LIMIT 50""", (user_id,)):
-        add(r["uid"], "uploaded an identical file", 15)
-
-    for r in await _all("""
-        SELECT DISTINCT g2.user_id AS uid FROM guild_members g1
-        JOIN guild_members g2 ON g2.guild_id=g1.guild_id AND g2.user_id!=g1.user_id
-                             AND g2.invite_code=g1.invite_code
-                             AND ABS(julianday(g2.joined_at_utc)-julianday(g1.joined_at_utc))*86400 < 1800
-        WHERE g1.user_id=? AND g1.invite_code IS NOT NULL LIMIT 100""", (user_id,)):
-        add(r["uid"], "joined a server with the same invite within 30 min", 10)
-
-    if me["account_created_utc"]:
-        for r in await _all("""SELECT user_id AS uid FROM user_profiles WHERE user_id!=?
-                               AND ABS(julianday(account_created_utc)-julianday(?))*86400 < 300 LIMIT 100""",
-                            (user_id, me["account_created_utc"])):
-            add(r["uid"], "account created within 5 min of this one", 10)
-
+        return {}
+    out = {}
+    def add(uid, reason, weight):
+        if uid != user_id and all(r != reason for r, _ in out.get(uid, [])):
+            out.setdefault(uid, []).append((reason, weight))
+    peers = await _all("SELECT p.* FROM user_profiles p JOIN guild_members m USING(user_id) WHERE m.guild_id=? AND p.user_id!=? LIMIT 5000", (guild_id, user_id))
     mine = {_canon(me["username"]), _canon(me["global_name"])} - {""}
-    if mine:
-        for r in await _all("SELECT user_id, username, global_name FROM user_profiles WHERE user_id!=?", (user_id,)):
-            theirs = {_canon(r["username"]), _canon(r["global_name"])} - {""}
-            best = 0.0
-            for a in mine:
-                for b in theirs:
-                    if min(len(a), len(b)) < 4 or abs(len(a) - len(b)) > 3:
-                        continue
-                    if a == b:
-                        best = 1.0
-                    else:
-                        sm = SequenceMatcher(None, a, b)
-                        if sm.quick_ratio() >= 0.85:
-                            best = max(best, sm.ratio())
-            if best == 1.0:
-                add(r["user_id"], "same name (ignoring digits/symbols)", 25)
-            elif best >= 0.85:
-                add(r["user_id"], "very similar name", 15)
+    for peer in peers:
+        if me["avatar_hash"] and peer["avatar_hash"] == me["avatar_hash"]:
+            add(peer["user_id"], "same avatar (may be a common image)", 20)
+        theirs = {_canon(peer["username"]), _canon(peer["global_name"])} - {""}
+        best = max((SequenceMatcher(None, x, y).ratio() for x in mine for y in theirs
+                    if min(len(x), len(y)) >= 4 and abs(len(x)-len(y)) <= 3), default=0)
+        if best >= .85:
+            add(peer["user_id"], "similar name", 15)
+    for row in await _all("""SELECT DISTINCT b.author_id AS uid FROM attachments a
+        JOIN attachments b ON b.sha256=a.sha256 AND b.author_id!=a.author_id AND b.guild_id=a.guild_id
+        WHERE a.guild_id=? AND a.author_id=? AND a.sha256 IS NOT NULL LIMIT 100""", (guild_id, user_id)):
+        add(row["uid"], "shared an identical file in this server", 10)
+    for row in await _all("""SELECT b.user_id AS uid FROM guild_members a JOIN guild_members b
+        ON b.guild_id=a.guild_id AND b.user_id!=a.user_id AND b.invite_code=a.invite_code
+        WHERE a.guild_id=? AND a.user_id=? AND a.invite_code IS NOT NULL
+        AND ABS(julianday(a.joined_at_utc)-julianday(b.joined_at_utc))*86400<1800 LIMIT 100""", (guild_id, user_id)):
+        add(row["uid"], "same invite within 30 minutes in this server", 10)
     return out
 
 
@@ -652,22 +700,192 @@ async def get_audit_events(user_id: int, guild_id: int, limit: int = 6):
 
 
 # ============================================================ retention / erasure
-async def prune_messages(older_than_iso: str) -> int:
-    await _run("""DELETE FROM message_edits WHERE message_id IN
-                  (SELECT message_id FROM message_log WHERE created_at_utc<?)""", (older_than_iso,))
-    await _run("""DELETE FROM attachments WHERE message_id IN
-                  (SELECT message_id FROM message_log WHERE created_at_utc<?)""", (older_than_iso,))
-    return await _run("DELETE FROM message_log WHERE created_at_utc<?", (older_than_iso,))
+PRIVACY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS guild_privacy (
+    guild_id INTEGER PRIMARY KEY, archive_enabled INTEGER NOT NULL DEFAULT 1,
+    retention_days INTEGER NOT NULL DEFAULT 30
+);
+CREATE TABLE IF NOT EXISTS archive_exclusions (
+    guild_id INTEGER NOT NULL, channel_id INTEGER NOT NULL, PRIMARY KEY(guild_id,channel_id)
+);
+CREATE TABLE IF NOT EXISTS capture_optouts (
+    guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, PRIMARY KEY(guild_id,user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_alarms_due ON alarms(paused,time_utc);
+CREATE INDEX IF NOT EXISTS idx_msg_retention ON message_log(guild_id,created_at_utc);
+CREATE INDEX IF NOT EXISTS idx_history_scope ON profile_history(guild_id,user_id,changed_at_utc);
+CREATE INDEX IF NOT EXISTS idx_edits_message ON message_edits(message_id);
+"""
 
 
-async def forget_user(user_id: int):
-    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
-        await db.execute("""DELETE FROM message_edits WHERE message_id IN
-                            (SELECT message_id FROM message_log WHERE author_id=?)""", (user_id,))
-        for table, col in (("attachments", "author_id"), ("message_log", "author_id"),
-                           ("user_profiles", "user_id"), ("profile_history", "user_id"),
-                           ("guild_members", "user_id"), ("avatar_mirrors", "user_id"),
-                           ("audit_events", "target_id"), ("compromised_users", "user_id"),
-                           ("compromised_fingerprints", "user_id"), ("compromised_exempt", "user_id")):
-            await db.execute(f"DELETE FROM {table} WHERE {col}=?", (user_id,))
-        await db.commit()
+def default_retention():
+    value = int(os.getenv("RETENTION_DAYS", "30") or "30")
+    if not 1 <= value <= 3650:
+        raise ValueError("RETENTION_DAYS must be between 1 and 3650; indefinite retention is disabled")
+    return value
+
+
+async def get_privacy(guild_id):
+    return await _one("SELECT * FROM guild_privacy WHERE guild_id=?", (guild_id,)) or {
+        "guild_id": guild_id, "archive_enabled": 1, "retention_days": default_retention()}
+
+
+async def set_privacy(guild_id, *, archive_enabled=None, retention_days=None):
+    current = await get_privacy(guild_id)
+    if retention_days is not None and not 1 <= retention_days <= 3650:
+        raise ValueError("Retention must be 1–3650 days")
+    await _run("""INSERT INTO guild_privacy VALUES (?,?,?) ON CONFLICT(guild_id) DO UPDATE SET
+        archive_enabled=excluded.archive_enabled,retention_days=excluded.retention_days""",
+        (guild_id, current["archive_enabled"] if archive_enabled is None else int(archive_enabled),
+         current["retention_days"] if retention_days is None else retention_days))
+
+
+async def get_privacy_guilds():
+    return await _all("SELECT * FROM guild_privacy")
+
+
+async def set_archive_exclusion(guild_id, channel_id, excluded):
+    if excluded:
+        await _run("INSERT OR IGNORE INTO archive_exclusions VALUES (?,?)", (guild_id, channel_id))
+    else:
+        await _run("DELETE FROM archive_exclusions WHERE guild_id=? AND channel_id=?", (guild_id, channel_id))
+
+
+async def set_capture_optout(user_id, guild_id, enabled):
+    if enabled:
+        await _run("INSERT OR IGNORE INTO capture_optouts VALUES (?,?)", (guild_id or 0, user_id))
+    else:
+        await _run("DELETE FROM capture_optouts WHERE guild_id=? AND user_id=?", (guild_id or 0, user_id))
+
+
+async def should_archive(guild_id, channel_id=None, user_id=None, parent_ids=()):
+    if not (await get_privacy(guild_id))["archive_enabled"]:
+        return False
+    if user_id is not None and await _one("SELECT 1 FROM capture_optouts WHERE user_id=? AND guild_id IN (0,?)", (user_id, guild_id)):
+        return False
+    ids = [i for i in (channel_id, *parent_ids) if i is not None]
+    if ids:
+        marks = ",".join("?" for _ in ids)
+        if await _one(f"SELECT 1 FROM archive_exclusions WHERE guild_id=? AND channel_id IN ({marks})", (guild_id, *ids)):
+            return False
+    return True
+
+
+async def prune_messages(older_than_iso, guild_id=None):
+    scope, args = (" AND guild_id=?", (older_than_iso, guild_id)) if guild_id is not None else ("", (older_than_iso,))
+    selector = "SELECT message_id FROM message_log WHERE created_at_utc<?" + scope
+    count = await _one("SELECT COUNT(*) AS n FROM message_log WHERE created_at_utc<?" + scope, args)
+    await run_transaction([
+        ("DELETE FROM message_edits WHERE message_id IN (" + selector + ")", args),
+        ("DELETE FROM attachments WHERE message_id IN (" + selector + ")", args),
+        ("DELETE FROM message_log WHERE created_at_utc<?" + scope, args),
+    ])
+    return count["n"]
+
+
+async def prune_history(older_than_iso, guild_id):
+    await run_transaction([
+        ("DELETE FROM profile_history WHERE guild_id=? AND changed_at_utc<?", (guild_id, older_than_iso)),
+        ("DELETE FROM audit_events WHERE guild_id=? AND created_at_utc<?", (guild_id, older_than_iso)),
+        ("DELETE FROM purge_audit WHERE guild_id=? AND ran_at_utc<?", (guild_id, older_than_iso)),
+        ("DELETE FROM guild_members WHERE guild_id=? AND left_at_utc<?", (guild_id, older_than_iso)),
+    ])
+
+
+async def _table_columns():
+    tables = await _all("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+    result = {}
+    for table in tables:
+        name = table["name"]
+        if re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", name):
+            result[name] = {r["name"] for r in await _all(f'PRAGMA table_info("{name}")')}
+    return result
+
+
+async def forget_user(user_id: int, guild_id=None, *, include_security=False):
+    """Erase archived/personal data within the requested scope. Active security is separate.
+
+    Global erasure is reserved for the person's own private request. A guild caller
+    never erases preferences, another guild's rows, or shared public profile state.
+    Failed mirror deletions retain guardian_media pointers so they can be retried.
+    """
+    columns = await _table_columns()
+    scope = " AND guild_id=?" if guild_id is not None else ""
+    args = (user_id, guild_id) if guild_id is not None else (user_id,)
+    statements = [("DELETE FROM message_edits WHERE message_id IN (SELECT message_id FROM message_log WHERE author_id=?" + scope + ")", args)]
+    owned = {
+        "attachments": "author_id", "message_log": "author_id", "profile_history": "user_id",
+        "guild_members": "user_id", "alarms": "user_id", "alarm_delivery_history": "user_id",
+        "community_event_subscriptions": "user_id", "community_event_delivery": "user_id",
+        "community_event_preferences": "user_id",
+    }
+    for table, column in owned.items():
+        if table not in columns:
+            continue
+        if guild_id is not None and "guild_id" not in columns[table]:
+            continue
+        statements.append((f"DELETE FROM {table} WHERE {column}=?" + scope, args))
+    if "community_events" in columns:
+        event_selector = "SELECT id FROM community_events WHERE creator_id=?" + scope
+        if "community_event_delivery" in columns:
+            statements.append(("UPDATE community_event_delivery SET state='cancelled' WHERE event_id IN (" + event_selector + ")", args))
+        statements.append(("UPDATE community_events SET state='cancelled' WHERE creator_id=?" + scope, args))
+    # Audit and report records include other people's actions; remove the requested
+    # person's references and their free text without destroying others' cases.
+    for table, fields in {
+        "audit_events": ("actor_id", "target_id"), "purge_audit": ("invoker_id",),
+        "community_events": ("creator_id",),
+        "guild_members": ("inviter_id",),
+    }.items():
+        if table not in columns or (guild_id is not None and "guild_id" not in columns[table]):
+            continue
+        for field in fields:
+            if field not in columns[table]:
+                continue
+            redact = [f"{field}=0"]
+            for textcol in ("summary", "command", "reason", "evidence", "note", "detail", "details", "resolution", "title"):
+                if textcol in columns[table]:
+                    redact.append(f"{textcol}='[erased]'")
+            statements.append((f"UPDATE {table} SET " + ",".join(redact) + f" WHERE {field}=?" + scope, args))
+    if guild_id is None:
+        for table in ("user_profiles", "avatar_mirrors", "user_timezones", "alarm_user_preferences"):
+            if table in columns:
+                statements.append((f"DELETE FROM {table} WHERE user_id=?", (user_id,)))
+        # Legacy global security references are no longer used for enforcement.
+        for table in ("compromised_users", "compromised_fingerprints", "compromised_exempt"):
+            if table in columns:
+                statements.append((f"DELETE FROM {table} WHERE user_id=?", (user_id,)))
+        statements.append(("UPDATE compromised_users SET flagged_by=0 WHERE flagged_by=?", (user_id,)))
+    if include_security:
+        for table in ("guardian_flags", "guardian_patterns", "guardian_exempt"):
+            if table in columns and "user_id" in columns[table]:
+                security_scope = " AND source_guild_id=?" if guild_id is not None else ""
+                statements.append((f"DELETE FROM {table} WHERE user_id=?" + security_scope, args))
+    await run_transaction(statements)
+
+
+async def export_user(user_id, guild_id=None):
+    """Only return this person's records; never staff notes or others' reports."""
+    columns = await _table_columns()
+    result = {}
+    personal = {
+        "message_log": "author_id", "attachments": "author_id", "profile_history": "user_id",
+        "guild_members": "user_id", "alarms": "user_id", "alarm_delivery_history": "user_id",
+        "community_event_subscriptions": "user_id", "community_event_delivery": "user_id",
+        "community_event_preferences": "user_id",
+    }
+    if guild_id is None:
+        personal.update(user_profiles="user_id", user_timezones="user_id", alarm_user_preferences="user_id")
+    for table, column in personal.items():
+        if table not in columns or (guild_id is not None and "guild_id" not in columns[table]):
+            continue
+        scope = " AND guild_id=?" if guild_id is not None else ""
+        args = (user_id,guild_id) if guild_id is not None else (user_id,)
+        result[table] = await _all(f"SELECT * FROM {table} WHERE {column}=?" + scope, args)
+        if table == "guild_members":
+            for row in result[table]:
+                row.pop("inviter_id", None)
+                row.pop("invite_code", None)
+    result["scope"] = "all your personal data" if guild_id is None else f"server {guild_id}"
+    result["notice"] = "Staff reports, private notes, and active security evidence are not exposed by this export."
+    return result
