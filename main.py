@@ -69,7 +69,7 @@ async def sync_commands(ctx):
     await ctx.send(f'Synced {len(synced)} application commands.')
 
 HELP_SECTIONS = [
-    ("⏰ Alarms", (), [
+    (" Alarms", (), [
         ("!settimezone <Area/City>", "e.g. `Asia/Dhaka`, `America/New_York`"),
         ("!gettimezone", "show your timezone"),
         ("!setalarm <time> [daily|weekly] [| message]", "e.g. `!setalarm tomorrow 9am daily | Wake up` · `!setalarm in 2h | Tea` · `!setalarm 15:30`"),
@@ -79,20 +79,20 @@ HELP_SECTIONS = [
         ("!pausealarm <id>  ·  !resumealarm <id>", "pause / resume"),
         ("!deletealarm <id>", "remove an alarm"),
     ]),
-    ("🧹 Delete messages  (Manage Messages)", ("manage_messages",), [
-        ("!alarmbot -d -u @user -t 1H -c #a #b", "`-u` users (several, or `all`) · `-t` time `30m` `1H` `2d` `1w` `6mo` `1y` `1d12h` or `all` · "
+    (" Delete messages  (Manage Messages)", ("manage_messages",), [
+        ("!zzzzzzzzzzzzzzzzzzzzzzzzzzzzzz -d -u @user -t 1H -c #a #b", "`-u` users (several, or `all`) · `-t` time `30m` `1H` `2d` `1w` `6mo` `1y` `1d12h` or `all` · "
                                                  "`-c` channels (several, a category, `all`; omit = this channel). Asks to confirm when it's broad."),
     ]),
-    ("🚨 Compromised accounts  (Manage Messages + Moderate Members)", ("manage_messages", "moderate_members"), [
+    (" Compromised accounts  (Manage Messages + Moderate Members)", ("manage_messages", "moderate_members"), [
         ("!compromised [@user] [24h|7d|perm] [reason]", "or just **reply** to the bad message with `!compromised`. Deletes their last hour of messages, "
                                                         "applies protection here and in servers that explicitly trust this server. Only confirmed evidence becomes a pattern."),
         ("!uncompromised @user", "clear this server's flag and ignore accepted external flags here. Restore only unchanged Guardian-owned timeouts; preserve unrelated moderation."),
         ("!flagged", "list active flags"),
     ]),
-    ("🔎 Investigation  (Moderate Members)", ("moderate_members",), [
+    (" Investigation  (Moderate Members)", ("moderate_members",), [
         ("!userinfo @user", "history, join invite, staff actions and possible alt accounts in this server only (aliases: `!whois`, `!trace`)"),
     ]),
-    ("📜 Logging & server setup  (Administrator)", ("administrator",), [
+    (" Logging & server setup  (Administrator)", ("administrator",), [
         ("!setuplogs #channel", "one-time setup: default log channel + every log type on (alias `!setlogchannel`)"),
         ("!setlog <category> <#channel|off|default>", "send a category to its own channel. Categories: `messages` `media` `members` `voice` `roles` `moderation` `server` `security`"),
         ("!logstatus", "show where everything goes + which bot permissions are missing"),
@@ -100,20 +100,20 @@ HELP_SECTIONS = [
         ("!mediamirror on|off", "copy attachments into the `media` log channel as they're sent"),
         ("!protect on|off", "enable or disable network protection; receiving servers must also explicitly trust the source"),
     ]),
-    ("🔒 Archive privacy  (Administrator)", ("administrator",), [
+    (" Archive privacy  (Administrator)", ("administrator",), [
         ("!privacysettings · !archiveexclude", "configure this server's archive, retention and excluded channels/categories"),
         ("!forgetuser <user id>", "erase this server's routine archived user data; active security and moderation cases remain"),
     ]),
-    ("🤝 Community", (), [
+    (" Community", (), [
         ("/report · Message menu → Report message", "privately report an issue to this server's moderators"),
         ("/appeal", "request review of a resolved case involving you"),
         ("/event · /events · /eventcancel · /eventdelivery", "create shared events, subscribe voluntarily and choose delivery in this server"),
         ("/dataoptout · /dataexport · /forgetme", "manage your own stored data; a server command affects only this server, DM management covers your account"),
     ]),
-    ("📋 Cases  (Moderate Members)", ("moderate_members",), [
+    (" Cases  (Moderate Members)", ("moderate_members",), [
         ("/cases · /case · /resolve · /caseaction", "review reports, resolve cases, record warnings or apply a local timeout"),
     ]),
-    ("🛠 Community setup  (Manage Server)", ("manage_guild",), [
+    (" Community setup  (Manage Server)", ("manage_guild",), [
         ("!reportsetup · !communitysecurity · !health", "configure staff notifications, spam/raid detection and inspect setup diagnostics"),
     ]),
 ]
